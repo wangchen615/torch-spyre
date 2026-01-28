@@ -35,7 +35,6 @@
 
 #ifdef TEST_VF_ALLOCATOR
 
-#include "module.h"
 #include <cassert>
 #include <cstdlib>
 #include <iostream>
@@ -43,6 +42,36 @@
 #include <string>
 #include <unordered_map>
 #include <set>
+
+// Minimal type definitions for standalone testing
+namespace spyre {
+  struct FreeInterval {
+    size_t start;
+    size_t end;
+    bool operator<(const FreeInterval& other) const {
+      return start < other.start;
+    }
+  };
+  
+  struct BlockInfo {
+    size_t offset_init = 0;
+    size_t offset_end = 0;
+    BlockInfo() = default;
+    BlockInfo(size_t init, size_t end) : offset_init(init), offset_end(end) {}
+  };
+  
+  struct SegmentInfo {
+    int segment_id;
+    size_t total_size;
+    size_t free_size;
+    std::vector<BlockInfo> blocks;
+    std::set<FreeInterval> free_intervals;
+    std::set<size_t> free_interval_sizes;
+    
+    SegmentInfo(int id, size_t size) 
+      : segment_id(id), total_size(size), free_size(size) {}
+  };
+}
 
 using namespace spyre;
 
@@ -224,9 +253,5 @@ int main() {
 
 #else
 // If not compiled with TEST_VF_ALLOCATOR, provide a message
-int main() {
-  std::cout << "This file should be compiled with -DTEST_VF_ALLOCATOR\n";
-  std::cout << "Or use Google Test framework for more comprehensive testing.\n";
-  return 1;
-}
+// This file is only meant to be compiled with -DTEST_VF_ALLOCATOR
 #endif  // TEST_VF_ALLOCATOR
