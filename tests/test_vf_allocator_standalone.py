@@ -138,15 +138,17 @@ class TestVFAllocatorStandalone(unittest.TestCase):
 
     def test_interleaved_allocations(self):
         """Test interleaved allocation pattern."""
-        batch1 = [torch.empty(200, device="spyre", dtype=torch.float16) for _ in range(3)]
+        t1 = torch.empty(200, device="spyre", dtype=torch.float16)
+        t2 = torch.empty(200, device="spyre", dtype=torch.float16)
+        t3 = torch.empty(200, device="spyre", dtype=torch.float16)
 
-        del batch1[1]
+        del t2
         gc.collect()
 
         batch2 = [torch.empty(200, device="spyre", dtype=torch.float16) for _ in range(2)]
 
-        self.assertEqual(batch1[0].numel(), 200)
-        self.assertEqual(batch1[2].numel(), 200)
+        self.assertEqual(t1.numel(), 200)
+        self.assertEqual(t3.numel(), 200)
         for t in batch2:
             self.assertEqual(t.numel(), 200)
 
@@ -170,8 +172,9 @@ class TestVFAllocatorStandalone(unittest.TestCase):
 
     def test_tensor_operations_with_vf_allocator(self):
         """Test that tensor operations work correctly with VF allocator."""
-        x = torch.randn(100, device="spyre", dtype=torch.float16)
-        y = torch.randn(100, device="spyre", dtype=torch.float16)
+        # Create tensors on CPU first, then move to spyre device
+        x = torch.randn(100, dtype=torch.float16).to("spyre")
+        y = torch.randn(100, dtype=torch.float16).to("spyre")
 
         z = x + y
         w = x * y
