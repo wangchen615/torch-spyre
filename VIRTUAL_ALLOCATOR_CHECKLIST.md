@@ -231,20 +231,20 @@
    - Blocks: Proper deallocation
 
 ### Important (Should Fix)
-3. **copy_data() not implemented** - Device-to-device copies
+1. **copy_data() not implemented** - Device-to-device copies
    - Solution: Extract offset and handle offsets in DMA
    - Blocks: Full copy operation support
 
-4. **Eviction policy too simple** - Only evicts empty chunks
+2. **Eviction policy too simple** - Only evicts empty chunks
    - Solution: Implement LRU or size-based eviction
    - Affects: Memory pressure scenarios
 
 ### Nice to Have (Can Defer)
-5. **Chunk size configuration** - Hardcoded at 256MB
+1. **Chunk size configuration** - Hardcoded at 256MB
    - Solution: Environment variable
    - Affects: Performance tuning
 
-6. **Detailed profiling** - Basic stats only
+2. **Detailed profiling** - Basic stats only
    - Solution: Add allocation timeline, history
    - Affects: Debugging and tuning
 

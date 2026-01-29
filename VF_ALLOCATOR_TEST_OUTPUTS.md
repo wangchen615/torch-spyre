@@ -203,6 +203,7 @@ OK
 ## Memory State During Realistic Pattern Test
 
 ### After Phase 1 (3 allocations)
+
 ```
 Segment 0:
 ├─ Block 0: [offset=0, size=128] (tensor a)
@@ -212,6 +213,7 @@ Segment 0:
 ```
 
 ### After Phase 2 (deallocate b)
+
 ```
 Segment 0:
 ├─ Block 0: [offset=0, size=128] (tensor a)
@@ -221,6 +223,7 @@ Segment 0:
 ```
 
 ### After Phase 3 (allocate d, reuses freed b)
+
 ```
 Segment 0:
 ├─ Block 0: [offset=0, size=128] (tensor a)
@@ -230,6 +233,7 @@ Segment 0:
 ```
 
 ### After Phase 6 (deallocate a, c, d)
+
 ```
 Segment 0:
 ├─ Free: [offset=0, size=128] (deallocated a)
@@ -240,6 +244,7 @@ Segment 0:
 ```
 
 ### After Phase 6 (intervals merged)
+
 ```
 Segment 0:
 ├─ Free: [offset=0, size=384] (merged intervals from a, d, c)
@@ -248,6 +253,7 @@ Segment 0:
 ```
 
 ### After Phase 7 (allocate k, j, l, f)
+
 ```
 Segment 0:
 ├─ Block 4: [offset=0, size=128] (tensor k, reused)

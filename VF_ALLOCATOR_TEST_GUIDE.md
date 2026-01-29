@@ -17,12 +17,14 @@ The VF (Virtual Function) allocator has been implemented with comprehensive test
 The C++ test binary tests the core allocator logic without requiring full runtime initialization.
 
 **Run all tests:**
+
 ```bash
 cd torch_spyre/csrc
 FLEX_DEVICE=VF ./test_vf_allocator
 ```
 
 **Expected output:**
+
 ```
 Running VF Allocator C++ Unit Tests
 ====================================
@@ -84,6 +86,7 @@ FLEX_DEVICE=VF python tests/test_vf_allocator_standalone.py TestVFAllocatorStand
 **Note: This option does not work in your current environment due to DOOM mode being disabled.**
 
 If DOOM mode were configured:
+
 ```bash
 FLEX_DEVICE=VF python -m pytest tests/test_vf_allocator.py -v
 ```

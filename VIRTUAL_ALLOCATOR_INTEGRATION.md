@@ -7,6 +7,7 @@ This document explains how to integrate the virtual allocator into the torch-spy
 The new `spyre_virtual_allocator.cpp` file needs to be included in the build. Update [setup.py](setup.py) to automatically pick it up:
 
 **Current behavior:**
+
 ```python
 sources = list(CSRC_DIR.glob("*.cpp"))  # Already includes all .cpp files!
 ```
@@ -14,6 +15,7 @@ sources = list(CSRC_DIR.glob("*.cpp"))  # Already includes all .cpp files!
 **Good news:** `setup.py` already uses glob to collect all `.cpp` files from `torch_spyre/csrc/`, so `spyre_virtual_allocator.cpp` will be automatically included in the next build. ✅
 
 **To verify:**
+
 ```bash
 python setup.py build_ext --inplace  # Will compile the new .cpp file
 ```
@@ -21,6 +23,7 @@ python setup.py build_ext --inplace  # Will compile the new .cpp file
 ## Step 2: Extend Context Structure
 
 Currently, `SharedOwnerCtx` in [module.h](torch_spyre/csrc/module.h) only stores:
+
 ```cpp
 struct SharedOwnerCtx {
   flex::DeviceMemoryAllocationPtr owner;
@@ -31,6 +34,7 @@ struct SharedOwnerCtx {
 **Need to add:** Offset information for virtual allocator.
 
 ### Option A: Extend SharedOwnerCtx (Breaking Change)
+
 ```cpp
 struct SharedOwnerCtx {
   flex::DeviceMemoryAllocationPtr owner;
@@ -46,6 +50,7 @@ struct SharedOwnerCtx {
 
 ### Option B: Create VirtualAllocationContext (Recommended)
 Create new context struct in `spyre_virtual_allocator.h`:
+
 ```cpp
 struct VirtualAllocationContext {
   flex::DeviceMemoryAllocationPtr chunk_handle;
@@ -64,6 +69,7 @@ Store in allocations_ map as `(data_ptr, AllocationInfo)` for lookup during deal
 Current issue: `on_deleter()` doesn't know which pointer to deallocate.
 
 ### Current Flow (Broken in Virtual Allocator):
+
 ```cpp
 static void on_deleter(void* ctx_void) {
   auto* ctx = static_cast<VirtualAllocationContext*>(ctx_void);
@@ -76,6 +82,7 @@ static void on_deleter(void* ctx_void) {
 ### Solution: Store data_ptr in context
 
 Modify `on_deleter()` to store and use data_ptr:
+
 ```cpp
 struct VirtualAllocationContext {
   flex::DeviceMemoryAllocationPtr chunk_handle;
@@ -94,6 +101,7 @@ static void on_deleter(void* ctx_void) {
 ## Step 4: Update Tensor Operations
 
 Operations like `matmul`, `add`, etc. currently extract handles like:
+
 ```cpp
 // From codegen/inputs/spyre_torch_ops.cpp:207
 eager_inputs[eager_idx] = (static_cast<SharedOwnerCtx *>(
@@ -102,6 +110,7 @@ eager_inputs[eager_idx] = (static_cast<SharedOwnerCtx *>(
 ```
 
 **Need to update** to also pass offset:
+
 ```cpp
 auto* ctx = static_cast<VirtualAllocationContext*>(
     tmp_tensor.storage().data_ptr().get_context()
@@ -114,6 +123,7 @@ operation_offsets[eager_idx] = offset;  // NEW
 ```
 
 **Or:** Backend might support passing offset as part of SetSpyreData:
+
 ```cpp
 inp_tensor.SetSpyreData(ctx->chunk_handle, ctx->chunk_offset);  // NEW API?
 ```
@@ -144,6 +154,7 @@ auto copy_host_to_device(const at::Tensor& self, const at::Tensor& dst) {
 ## Step 6: Add to Registration
 
 In `setup.py`, make sure the header is available:
+
 ```python
 INCLUDE_DIRS += [
     CSRC_DIR,  # This already includes spyre_virtual_allocator.h
@@ -157,6 +168,7 @@ No changes needed - headers in csrc/ are automatically available.
 Add environment variable to choose allocator mode:
 
 In [spyre_mem.cpp](torch_spyre/csrc/spyre_mem.cpp):
+
 ```cpp
 bool use_virtual_allocator() {
   const char* env = std::getenv("TORCH_SPYRE_VIRTUAL_ALLOCATOR");
@@ -168,15 +180,16 @@ bool use_virtual_allocator() {
 
 // In allocator registration:
 if (use_virtual_allocator()) {
-  REGISTER_ALLOCATOR(c10::DeviceType::PrivateUse1, 
+  REGISTER_ALLOCATOR(c10::DeviceType::PrivateUse1,
                     &VirtualSpyreAllocator::instance());
 } else {
-  REGISTER_ALLOCATOR(c10::DeviceType::PrivateUse1, 
+  REGISTER_ALLOCATOR(c10::DeviceType::PrivateUse1,
                     &SpyreAllocator::instance());
 }
 ```
 
 **Usage:**
+
 ```bash
 export TORCH_SPYRE_VIRTUAL_ALLOCATOR=1
 python your_script.py
@@ -187,6 +200,7 @@ python your_script.py
 ### Unit Tests for Virtual Allocator
 
 Create [tests/test_virtual_allocator.py](tests/test_virtual_allocator.py):
+
 ```python
 import torch
 import torch_spyre
@@ -201,7 +215,7 @@ def test_many_tensors():
     for i in range(100):
         t = torch.randn(1024, 1024, device="spyre")
         tensors.append(t)
-    
+  
     # If this succeeds, virtual allocator is working!
     assert len(tensors) == 100
     print(f"✓ Created 100 tensors with virtual allocator")
@@ -215,7 +229,7 @@ def test_eviction():
             tensors.append(t)
     except RuntimeError:
         pass  # Expected when we run out of backend memory
-    
+  
     # Verify some tensors were created
     assert len(tensors) > 0
     print(f"✓ Eviction handled {len(tensors)} allocations")
@@ -227,15 +241,15 @@ def test_fragmentation():
     small1 = torch.randn(1_000_000, device="spyre")  # 1MB
     big2 = torch.randn(100_000_000, device="spyre")  # 100MB
     small2 = torch.randn(1_000_000, device="spyre")  # 1MB
-    
+  
     # Delete in a way that fragments: big1, small1
     del big1
     del small1
-    
+  
     # Now try to allocate a 50MB tensor
     # Should succeed if coalescing is working
     medium = torch.randn(50_000_000, device="spyre")
-    
+  
     assert medium is not None
     print("✓ Fragmentation coalescing working")
 
@@ -248,11 +262,12 @@ if __name__ == "__main__":
 ### Integration Tests
 
 Update [tests/test_spyre.py](tests/test_spyre.py):
+
 ```python
 # Add with virtual allocator enabled
 def test_with_virtual_allocator():
     os.environ["TORCH_SPYRE_VIRTUAL_ALLOCATOR"] = "1"
-    
+  
     # Run existing tests
     test_spyre_empty()
     test_copy_host_to_device()
@@ -263,17 +278,20 @@ def test_with_virtual_allocator():
 ## Step 9: Compilation & Verification
 
 ### Build the extension:
+
 ```bash
 python setup.py build_ext --inplace
 ```
 
 ### Verify new file is compiled:
+
 ```bash
 # Should see spyre_virtual_allocator.cpp in compilation output
 python setup.py build_ext --inplace 2>&1 | grep spyre_virtual_allocator
 ```
 
 ### Quick test:
+
 ```bash
 python -c "import torch_spyre; print('Virtual allocator imported')"
 ```
@@ -282,6 +300,7 @@ python -c "import torch_spyre; print('Virtual allocator imported')"
 
 ### Issue 1: Compilation errors in new .cpp
 **Check:** Are all includes present?
+
 ```cpp
 #include "logging.h"      // For DEBUGINFO
 #include "module.h"       // For SharedOwnerCtx, GlobalRuntime

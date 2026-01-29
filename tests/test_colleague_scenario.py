@@ -4,7 +4,7 @@ print("---------- allocate tensor a -------------")
 a = torch.tensor([0], dtype=torch.float16, device="spyre")
 
 print("\n\n---------- allocate tensor b -------------")
-b = torch.tensor([0.], dtype=torch.float16, device="spyre")
+b = torch.tensor([0.0], dtype=torch.float16, device="spyre")
 
 print("\n\n---------- allocate tensor c -------------")
 c = torch.tensor([1, 2], dtype=torch.float16, device="spyre")
@@ -20,9 +20,14 @@ d = torch.tensor([1, 9, 8, 4], dtype=torch.float16, device="spyre")
 
 print("\n\n---------- allocate tensor e -------------")
 e = torch.tensor(
-    [[1., 0., -1., 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0], [1., 0., -1., 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0],
-     [1., 0., -1., 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0], [1., 0., -1., 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0]],
-    dtype=torch.float16, device="spyre"
+    [
+        [1.0, 0.0, -1.0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0],
+        [1.0, 0.0, -1.0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0],
+        [1.0, 0.0, -1.0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0],
+        [1.0, 0.0, -1.0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0],
+    ],
+    dtype=torch.float16,
+    device="spyre",
 )
 
 print("\n\n---------- deallocate tensor a, c, d -------------")
@@ -37,15 +42,15 @@ print("\n\n---------- allocate tensor j -------------")
 j = torch.tensor([1, 2], dtype=torch.float16, device="spyre")
 
 print("\n\n---------- allocate tensor i -------------")
-l = torch.tensor([7, 0, 4, 9], dtype=torch.float16, device="spyre")
+tensor_i = torch.tensor([7, 0, 4, 9], dtype=torch.float16, device="spyre")
 
 print("\n\n---------- allocate tensor f -------------")
 f = torch.tensor([6, 6, 6], dtype=torch.float16, device="spyre")
 
 print("\n\n---------- SUCCESS: All tensors allocated and managed correctly! ----------")
-print(f"Final tensors on device:")
+print("Final tensors on device:")
 print(f"  e: {e.shape}, device={e.device}")
 print(f"  k: {k.shape}, device={k.device}")
 print(f"  j: {j.shape}, device={j.device}")
-print(f"  l: {l.shape}, device={l.device}")
+print(f"  tensor_i: {tensor_i.shape}, device={tensor_i.device}")
 print(f"  f: {f.shape}, device={f.device}")

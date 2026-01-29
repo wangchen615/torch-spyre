@@ -90,6 +90,7 @@ Current implementation has a gap in tracking chunk offsets:
 - `on_deleter()` callback doesn't have data_ptr to deallocate properly
 
 **Solution:** Need to create `VirtualAllocationContext` or extend `SharedOwnerCtx`:
+
 ```cpp
 struct VirtualAllocationContext {
   flex::DeviceMemoryAllocationPtr chunk_handle;
@@ -117,7 +118,7 @@ Currently fixed at 256MB - may need to:
 - Auto-tune based on available backend memory
 - Support different sizes per device
 
-### 5. **Statistics & Debugging** 
+### 5. **Statistics & Debugging**
 `get_stats_string()` provides:
 - Chunk usage (N/16)
 - Total allocations count

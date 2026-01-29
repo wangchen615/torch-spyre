@@ -54,6 +54,7 @@ VirtualSpyreAllocator : at::Allocator {
 ## Key Algorithms
 
 ### First-Fit Allocation (Chunk::try_allocate)
+
 ```
 For each free block in free_blocks:
   If block.size >= nbytes:
@@ -63,6 +64,7 @@ Return -1 (no space)
 ```
 
 ### Coalescing (Chunk::coalesce_free_blocks)
+
 ```
 1. Sort free_blocks by offset
 2. Merge adjacent blocks (offset1 + size1 == offset2)
@@ -70,6 +72,7 @@ Return -1 (no space)
 ```
 
 ### Allocation Flow (VirtualSpyreAllocator::allocate)
+
 ```
 1. Try find_chunk_with_space()
 2. If none, allocate_new_chunk() (if < 16 chunks)
@@ -104,12 +107,14 @@ Return -1 (no space)
 ## How to Use (After Integration)
 
 ### Enable Virtual Allocator
+
 ```bash
 export TORCH_SPYRE_VIRTUAL_ALLOCATOR=1
 python your_script.py
 ```
 
 ### Check Stats (in Python)
+
 ```python
 from torch_spyre.csrc import VirtualSpyreAllocator
 allocator = VirtualSpyreAllocator.instance()
@@ -136,6 +141,7 @@ MAX_CHUNKS = 16                  // VF mode limit
 - Headers in `csrc/` are automatically available ✅
 
 ### Manual Test
+
 ```bash
 cd /home/chenw615/dt-inductor/torch-spyre
 python setup.py build_ext --inplace 2>&1 | grep spyre_virtual_allocator
@@ -173,6 +179,7 @@ python setup.py build_ext --inplace 2>&1 | grep spyre_virtual_allocator
 ## Debug Output
 
 Enable full logging:
+
 ```bash
 export TORCH_SPYRE_DEBUG=1
 export TORCH_SPYRE_VIRTUAL_ALLOCATOR=1
@@ -180,6 +187,7 @@ python script.py 2>&1 | grep "VirtualSpyreAllocator"
 ```
 
 Sample output:
+
 ```
 VirtualSpyreAllocator::allocate - 1048576 bytes on device 0
 VirtualSpyreAllocator::find_chunk_with_space - looking for 1048576 bytes

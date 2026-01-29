@@ -37,8 +37,9 @@
 #include <sendnn/runtime/runtime_interface.hpp>
 #include <sendnn/tensor/sentensor_info.hpp>
 #include <sendnn/util/status.hpp>
-#include <string>
 #include <stdexcept>  // throw exceptions
+#include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -440,14 +441,16 @@ struct SpyreAllocator final : public at::Allocator {
   size_t vf_offset = 0;
   std::unordered_map<void*, SegmentInfo*> block_to_segment;
 
-  SpyreAllocator(size_t seg_sz = size_t{8} * 1024 * 1024 * 1024)  // 8 GB Segment size
-    : segment_size(seg_sz) {
-    /* This constructor determines if using VF of PF mode based on FLEX_DEVICE env var.
-    Alternatively to the following method, we could check if allocator
+  SpyreAllocator(size_t seg_sz = size_t{8} * 1024 * 1024 *
+                                 1024)  // 8 GB Segment size
+      : segment_size(seg_sz) {
+    /* This constructor determines if using VF of PF mode based on FLEX_DEVICE
+    env var. Alternatively to the following method, we could check if allocator
     attribute vfw_ is nullptr. If so, PF is in use, otherwise VF.
-    However, this requires allocator object of type flex::DeviceMemoryAllocatorPtr
-    to exist, which doesn't yet in this constructor. Can be checked within allocate()
-    method though. However, vfw_ is private and needs a getter created in Flex.
+    However, this requires allocator object of type
+    flex::DeviceMemoryAllocatorPtr to exist, which doesn't yet in this
+    constructor. Can be checked within allocate() method though. However, vfw_
+    is private and needs a getter created in Flex.
     */
 
     const char* fmode_envvar = std::getenv("FLEX_DEVICE");
@@ -456,19 +459,22 @@ struct SpyreAllocator final : public at::Allocator {
 
     std::string fmode = fmode_envvar;
     if (fmode == "VF") {
-        use_pf = false;
+      use_pf = false;
     } else if (fmode == "PF") {
-        use_pf = true;
+      use_pf = true;
     } else {
       throw std::runtime_error("Unsupported FLEX_DEVICE env var value.");
     }
   }
 
   size_t setMinSpyreAllocation(size_t nbytes) const {
-  /* Adjust allocation according to Spyre requirement. */
+    /* Adjust allocation according to Spyre requirement. */
 
-    if (nbytes % min_alloc_bytes != 0)    // [AF] unclear if this check triggers: can nbytes request ever be misaligned?
-      return ((nbytes + min_alloc_bytes - 1) / min_alloc_bytes) * min_alloc_bytes;
+    if (nbytes % min_alloc_bytes !=
+        0)  // [AF] unclear if this check triggers: can nbytes request ever be
+            // misaligned?
+      return ((nbytes + min_alloc_bytes - 1) / min_alloc_bytes) *
+             min_alloc_bytes;
     return nbytes;
   }
 
@@ -479,10 +485,12 @@ struct SpyreAllocator final : public at::Allocator {
   };
 
   AllocationResult findFreeBlock(size_t nbytes) {
-  /* Locate first memory interval that can accommodate a block of size nbytes. */
+    /* Locate first memory interval that can accommodate a block of size nbytes.
+     */
 
     for (SegmentInfo& seg : segments) {
-      if (seg.free_interval_sizes.empty() || *seg.free_interval_sizes.rbegin() < nbytes)
+      if (seg.free_interval_sizes.empty() ||
+          *seg.free_interval_sizes.rbegin() < nbytes)
         continue;
 
       for (const FreeInterval& r : seg.free_intervals) {
@@ -493,17 +501,19 @@ struct SpyreAllocator final : public at::Allocator {
     return {nullptr, {}, false};  // free Block not found
   }
 
-  void allocateInSegment(SegmentInfo* seg, FreeInterval range,
-                         size_t nbytes, size_t& vf_offset) {
-  /* Given a predetermined Segment and a free memory range that accomodates at least
-  nbytes,   mark this memory occupied, recalculate free range, and update total Segment
-  free memory.
-  */
+  void allocateInSegment(SegmentInfo* seg, FreeInterval range, size_t nbytes,
+                         size_t& vf_offset) {
+    /* Given a predetermined Segment and a free memory range that accomodates at
+    least nbytes,   mark this memory occupied, recalculate free range, and
+    update total Segment free memory.
+    */
     vf_offset = range.start;
-    seg->free_intervals.erase(range);  // remove FreeInterval selected to contain the new Block
+    seg->free_intervals.erase(
+        range);  // remove FreeInterval selected to contain the new Block
     seg->free_interval_sizes.erase(range.end - range.start);
 
-    if (range.end - range.start > nbytes) { // if some space remains after Block creation
+    if (range.end - range.start >
+        nbytes) {  // if some space remains after Block creation
       FreeInterval new_range{range.start + nbytes, range.end};
       seg->free_intervals.insert(new_range);
       seg->free_interval_sizes.insert(range.end - range.start - nbytes);
@@ -514,14 +524,16 @@ struct SpyreAllocator final : public at::Allocator {
   SegmentInfo& createNewSegment(size_t nbytes,
                                 flex::DeviceMemoryAllocatorPtr allocator,
                                 size_t& vf_offset) {
-  /* Allocate new Segment and create a first Block at offset 0 in it.*/
+    /* Allocate new Segment and create a first Block at offset 0 in it.*/
 
     if (nbytes > segment_size)
       throw std::runtime_error("Requested memory exceeds Segment limit.");
 
     flex::DeviceMemoryAllocationPtr data;
-    allocator->TryAllocate(&data, segment_size, 0);  // reserve memory on Spyre but not moving tensor values into it yet
-    unsigned long alloc_idx = data->AllocIndex();
+    allocator->TryAllocate(
+        &data, segment_size,
+        0);  // reserve memory on Spyre but not moving tensor values into it yet
+    uint64_t alloc_idx = data->AllocIndex();
 
     segments.emplace_back(alloc_idx, segment_size);
     SegmentInfo& seg = segments.back();
@@ -539,22 +551,22 @@ struct SpyreAllocator final : public at::Allocator {
   // [AF] DEBUG ONLY - to be removed or made less verbose
   void logSegmentState(const SegmentInfo& seg, const char* context,
                        bool include_blocks = false) {
-  /* Log free and used memory in the specified Segment. */
+    /* Log free and used memory in the specified Segment. */
 
     DEBUGINFO(context, "seg id", seg.segment_id, "free mem", seg.free_size);
     if (include_blocks) {
       for (const auto& [soc_ptr, block] : seg.blocks)
-        DEBUGINFO("    ctx addr", soc_ptr, "-> block bounds:", block.offset_init, block.offset_end);
+        DEBUGINFO("    ctx addr", soc_ptr,
+                  "-> block bounds:", block.offset_init, block.offset_end);
     }
-    for (const size_t& sz : seg.free_interval_sizes)
-      DEBUGINFO("  free sz", sz);
+    for (const size_t& sz : seg.free_interval_sizes) DEBUGINFO("  free sz", sz);
     for (const FreeInterval& r : seg.free_intervals)
       DEBUGINFO("  free idx", r.start, "to", r.end);
   }
 
   // [AF] DEBUG ONLY - to be removed or made less verbose
   void logAllSegments(const char* context, bool include_blocks = false) {
-  /* Log free and used memory of all Segments. */
+    /* Log free and used memory of all Segments. */
 
     DEBUGINFO(context);
     for (const SegmentInfo& seg : segments) {
@@ -570,19 +582,21 @@ struct SpyreAllocator final : public at::Allocator {
 
   at::DataPtr allocate(size_t nbytes) override {
     c10::Device curr_device =
-      c10::impl::getDeviceGuardImpl(c10::DeviceType::PrivateUse1)->getDevice();
+        c10::impl::getDeviceGuardImpl(c10::DeviceType::PrivateUse1)
+            ->getDevice();
     auto device_id = curr_device.index();
     DEBUGINFO("allocating", nbytes, "bytes on Spyre", curr_device);
-    if (nbytes <= 0)
-      return {nullptr, nullptr, &ReportAndDelete, curr_device};
+    if (nbytes <= 0) return {nullptr, nullptr, &ReportAndDelete, curr_device};
 
     auto allocator = getAllocator(device_id);
     flex::DeviceMemoryAllocationPtr data;  // a smart-pointer object
-    AllocationResult alloc_result{nullptr, {}, false};  // VF Mode allocation result
+    AllocationResult alloc_result{
+        nullptr, {}, false};  // VF Mode allocation result
 
-    // NOTE: vfw_ is private attribute, we need a getter in Flex for this to work
-    // if (
-    //   (allocator->vfw_ == nullptr && !use_pf) || (allocator->vfw_ != nullptr && use_pf)
+    // NOTE: vfw_ is private attribute, we need a getter in Flex for this to
+    // work if (
+    //   (allocator->vfw_ == nullptr && !use_pf) || (allocator->vfw_ != nullptr
+    //   && use_pf)
     // ){
     //   throw std::runtime_error(
     //     "Mismatched detection of PF/VF mode. "
@@ -592,12 +606,13 @@ struct SpyreAllocator final : public at::Allocator {
 
     if (use_pf) {
       DEBUGINFO("PF allocation");
-      allocator->TryAllocate(&data, nbytes, 0);  // [AV] last argument should be set to 0
-    } else {  // VF mode
+      allocator->TryAllocate(&data, nbytes,
+                             0);  // [AV] last argument should be set to 0
+    } else {                      // VF mode
       /* Segments are allocated sequentially and never deallocated (for now).
-      Block are allocated within first (lowest offset) available free space and can be
-      deallocated, so that the memory can be reutilized.
-      This behavior may change in the future.
+      Block are allocated within first (lowest offset) available free space and
+      can be deallocated, so that the memory can be reutilized. This behavior
+      may change in the future.
       */
 
       nbytes = setMinSpyreAllocation(nbytes);
@@ -605,9 +620,12 @@ struct SpyreAllocator final : public at::Allocator {
 
       if (alloc_result.found) {
         DEBUGINFO(">>> VF block allocation");
-        allocateInSegment(alloc_result.segment, alloc_result.interval, nbytes, vf_offset);
-        data = alloc_result.segment->data;  // DeviceMemoryAllocationPtr shared within Segment
-        logSegmentState(*alloc_result.segment, "After block allocation");  // [AF] very verbose
+        allocateInSegment(alloc_result.segment, alloc_result.interval, nbytes,
+                          vf_offset);
+        data = alloc_result.segment
+                   ->data;  // DeviceMemoryAllocationPtr shared within Segment
+        logSegmentState(*alloc_result.segment,
+                        "After block allocation");  // [AF] very verbose
       } else {
         DEBUGINFO("*** VF segment allocation");
         SegmentInfo& seg = createNewSegment(nbytes, allocator, vf_offset);
@@ -622,8 +640,10 @@ struct SpyreAllocator final : public at::Allocator {
     void* ctx_void = static_cast<void*>(ctx);
     void* data_void = static_cast<void*>(ctx->owner.get());
 
-    if (!use_pf && alloc_result.found) { // add block info to mapping within last Segment
-      alloc_result.segment->blocks[ctx_void] = BlockInfo(vf_offset, vf_offset + nbytes);
+    if (!use_pf &&
+        alloc_result.found) {  // add block info to mapping within last Segment
+      alloc_result.segment->blocks[ctx_void] =
+          BlockInfo(vf_offset, vf_offset + nbytes);
       block_to_segment[ctx_void] = alloc_result.segment;
     }
 
@@ -631,7 +651,7 @@ struct SpyreAllocator final : public at::Allocator {
   }
 
   void deallocateBlock(SegmentInfo& seg, void* ctx_void) {
-  /* */
+    /* */
     auto it = seg.blocks.find(ctx_void);
     if (it == seg.blocks.end()) return;
 
@@ -666,7 +686,7 @@ struct SpyreAllocator final : public at::Allocator {
   }
 
   static void ReportAndDelete(void* ctx_void) {
-  /* Called when DataPtr is being deallocated. */
+    /* Called when DataPtr is being deallocated. */
 
     if (!ctx_void) return;
 
@@ -762,7 +782,8 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
   caffe2::TypeMeta dtype = c10::scalarTypeToTypeMeta(scalar_type);
   c10::Device device = device_opt.value_or(
       c10::impl::VirtualGuardImpl{c10::DeviceType::PrivateUse1}.getDevice());
-  // DEBUGINFO("Size:", size, ", Stride: ", stride, " on device ", device);  // [AF] to be restored
+  // DEBUGINFO("Size:", size, ", Stride: ", stride, " on device ", device);  //
+  // [AF] to be restored
   auto device_layout = SpyreTensorLayout(size.vec(), scalar_type);
   size_t size_bytes = get_device_size_in_bytes(device_layout);
 
@@ -790,7 +811,8 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
   }
 
   static_cast<SpyreTensorImpl*>(tensorImpl)->spyre_layout = device_layout;
-  // DEBUGINFO("SpyreTensorLayout: ", device_layout.toString());  // [AF] to be restored
+  // DEBUGINFO("SpyreTensorLayout: ", device_layout.toString());  // [AF] to be
+  // restored
   return tensor;
 }
 
@@ -843,8 +865,9 @@ at::Tensor& spyre_set_storage(at::Tensor& result, at::Storage storage,
  */
 at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
                            bool non_blocking) {
-  // DEBUGINFO("self (", self.scalar_type(), ") is on:", self.device());  // [AF] to be restored
-  // DEBUGINFO("dst (", dst.scalar_type(), ") on:", dst.device());  // [AF] to be restored
+  // DEBUGINFO("self (", self.scalar_type(), ") is on:", self.device());  //
+  // [AF] to be restored DEBUGINFO("dst (", dst.scalar_type(), ") on:",
+  // dst.device());  // [AF] to be restored
   at::Storage source_storage;
   at::Storage dest_storage;
 

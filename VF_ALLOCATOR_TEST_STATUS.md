@@ -9,6 +9,7 @@ The Python tests for the VF allocator cannot run in your environment due to **DO
 - **Result**: Spyre runtime fails to initialize with error `"Incompatible DOOM mode and device"`
 
 ### Error Encountered
+
 ```
 RuntimeError: {"DOOMState":"disabled","FlexDevice":"VF",...
 "message":"Incompatible DOOM mode and device","name":"RAS::CONFIGURATION::InvalidDeviceForDOOMMode"}
@@ -28,6 +29,7 @@ FLEX_DEVICE=VF ./test_vf_allocator
 ```
 
 **Results:**
+
 ```
 Running VF Allocator C++ Unit Tests
 ====================================
@@ -64,6 +66,7 @@ FLEX_DEVICE=VF python tests/test_vf_allocator_realistic_pattern.py
 ```
 
 **Current Output:**
+
 ```
 ======================================================================
   Phase 1: Initial Allocations
@@ -155,9 +158,11 @@ FLEX_DEVICE=VF python -m pytest tests/test_vf_allocator.py -v
 
 ### For Now (DOOM Mode Disabled)
 1. **Use C++ tests** as primary validation
+
    ```bash
    cd torch_spyre/csrc && FLEX_DEVICE=VF ./test_vf_allocator
    ```
+
 2. **Review Python test code** to understand intended behavior
 3. **Plan DOOM mode enablement** for full integration testing
 
@@ -177,6 +182,7 @@ FLEX_DEVICE=VF python -m pytest tests/test_vf_allocator.py -v
 
 ### Option A: Enable DOOM Mode
 Contact your Spyre driver/firmware team to enable DOOM mode configuration, then:
+
 ```bash
 # Run all Python tests
 FLEX_DEVICE=VF python tests/test_vf_allocator_realistic_pattern.py
@@ -189,6 +195,7 @@ Create a mock runtime layer that doesn't require DOOM mode for testing:
 
 ### Option C: Continue with C++ Tests (Current)
 C++ tests provide good coverage of allocator core logic:
+
 ```bash
 FLEX_DEVICE=VF ./torch_spyre/csrc/test_vf_allocator
 ```
@@ -205,4 +212,3 @@ FLEX_DEVICE=VF ./torch_spyre/csrc/test_vf_allocator
 | PyTorch Integration | ✅ Implemented | Ready for testing when DOOM enabled |
 | Realistic Pattern Test | 📄 Ready | Documented, awaiting DOOM mode |
 | Documentation | ✅ Complete | All files documented |
-
