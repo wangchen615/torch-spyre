@@ -1,0 +1,36 @@
+direction: down
+
+plugin: plugin (spyre-inference / hmlib) {
+  style.fill: "#fff4e6"
+  style.stroke: "#c1620a"
+  REG: "register_dmable_host_buffer(base, nbytes)\n(once, at pool attach)"
+  CP: "copy_tensor_raw(host_ptr, host_nbytes,\ndev_tensor, to_device)\n(per KV page)"
+}
+
+ts: torch-spyre (torch_spyre._C / SpyreStream) {
+  style.fill: "#eef5ff"
+  style.stroke: "#3b6fb3"
+  RH: "registerHostBuffer(base, nbytes)"
+  CR: "SpyreStream::copy_raw\nresolve CompositeAddress from SharedOwnerCtx;\nassert single_chunk; size = total_size()"
+  CAI: "copyAsyncImpl(host_ptr, composite,\ndci = nullptr, to_device)"
+  CR -> CAI
+}
+
+flex: flex (RuntimeStream) {
+  style.fill: "#e9f7ef"
+  style.stroke: "#1e7d44"
+  REGF: "registerHostBuffer -> IommuMapper::Map\n(cache IOVA for the window)"
+  DMA: "createDmaParams(dci=null) ->\nlaunchOperationH2D / launchOperationD2H"
+}
+
+POOL: "registered SHM pool\nhost DRAM, DMA-able" {
+  shape: cylinder
+  style.fill: "#fde8e8"
+  style.stroke: "#a83232"
+}
+
+plugin.REG -> ts.RH -> flex.REGF
+plugin.CP -> ts.CR
+ts.CAI -> flex.DMA
+flex.REGF -> POOL: "pins window" { style.stroke-dash: 3 }
+flex.DMA <-> POOL: "raw DMA of total_size() bytes"

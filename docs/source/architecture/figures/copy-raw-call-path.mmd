@@ -1,0 +1,35 @@
+%%{ init: { "flowchart": { "htmlLabels": true, "curve": "basis" }, "theme": "neutral" } }%%
+flowchart TB
+    subgraph plugin["<b>plugin</b> (spyre-inference / hmlib)"]
+        direction TB
+        REG["register_dmable_host_buffer(base, nbytes)<br/><i>once, at pool attach</i>"]
+        CP["copy_tensor_raw(host_ptr, host_nbytes,<br/>dev_tensor, to_device)<br/><i>per KV page</i>"]
+    end
+    subgraph ts["<b>torch-spyre</b> (torch_spyre._C / SpyreStream)"]
+        direction TB
+        RH["registerHostBuffer(base, nbytes)"]
+        CR["SpyreStream::copy_raw<br/>resolve CompositeAddress from SharedOwnerCtx;<br/>assert single_chunk; size = total_size()"]
+        CAI["copyAsyncImpl(host_ptr, composite,<br/>dci = <b>nullptr</b>, to_device)"]
+        CR --> CAI
+    end
+    subgraph flex["<b>flex</b> (RuntimeStream)"]
+        direction TB
+        REGF["registerHostBuffer → IommuMapper::Map<br/>(cache IOVA for the window)"]
+        DMA["createDmaParams(dci=null) →<br/>launchOperationH2D / launchOperationD2H"]
+    end
+    POOL[("<b>registered SHM pool</b><br/>host DRAM, DMA-able")]
+
+    REG --> RH --> REGF
+    CP --> CR
+    CAI --> DMA
+    REGF -.->|"pins window"| POOL
+    DMA <-->|"raw DMA of total_size() bytes"| POOL
+
+    classDef plug fill:#fff4e6,stroke:#c1620a,color:#3a2300
+    classDef tsp  fill:#eef5ff,stroke:#3b6fb3,color:#0b2447
+    classDef flx  fill:#e9f7ef,stroke:#1e7d44,color:#06331d
+    classDef mem  fill:#fde8e8,stroke:#a83232,color:#3a0000
+    class REG,CP plug
+    class RH,CR,CAI tsp
+    class REGF,DMA flx
+    class POOL mem

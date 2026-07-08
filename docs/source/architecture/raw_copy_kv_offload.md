@@ -30,6 +30,48 @@ hmlib-style shared-memory KV store — can:
    (**`register_dmable_host_buffer`**), rather than being forced to DMA only into torch-owned CPU
    tensors.
 
+The call path (plugin → torch-spyre → flex → the registered SHM pool):
+
+<!-- Source: figures/copy-raw-call-path.{mmd,d2}. Regenerate with:
+       npx -y -p @mermaid-js/mermaid-cli@10 mmdc -i docs/source/architecture/figures/copy-raw-call-path.mmd \
+         -o docs/source/architecture/figures/copy-raw-call-path.svg -b transparent
+       d2 docs/source/architecture/figures/copy-raw-call-path.d2 docs/source/architecture/figures/copy-raw-call-path.d2.svg -->
+
+![copy_tensor_raw / register_dmable_host_buffer call path from the plugin through torch-spyre and flex into the registered SHM pool](figures/copy-raw-call-path.svg)
+
+<details>
+<summary>Diagram sources (Mermaid at <code>figures/copy-raw-call-path.mmd</code>; D2 at <code>figures/copy-raw-call-path.d2</code>, rendered to <code>copy-raw-call-path.d2.svg</code>)</summary>
+
+```mermaid
+%%{ init: { "flowchart": { "htmlLabels": true, "curve": "basis" }, "theme": "neutral" } }%%
+flowchart TB
+    subgraph plugin["<b>plugin</b> (spyre-inference / hmlib)"]
+        direction TB
+        REG["register_dmable_host_buffer(base, nbytes)<br/><i>once, at pool attach</i>"]
+        CP["copy_tensor_raw(host_ptr, host_nbytes,<br/>dev_tensor, to_device)<br/><i>per KV page</i>"]
+    end
+    subgraph ts["<b>torch-spyre</b> (torch_spyre._C / SpyreStream)"]
+        direction TB
+        RH["registerHostBuffer(base, nbytes)"]
+        CR["SpyreStream::copy_raw<br/>resolve CompositeAddress from SharedOwnerCtx;<br/>assert single_chunk; size = total_size()"]
+        CAI["copyAsyncImpl(host_ptr, composite,<br/>dci = <b>nullptr</b>, to_device)"]
+        CR --> CAI
+    end
+    subgraph flex["<b>flex</b> (RuntimeStream)"]
+        direction TB
+        REGF["registerHostBuffer → IommuMapper::Map<br/>(cache IOVA for the window)"]
+        DMA["createDmaParams(dci=null) →<br/>launchOperationH2D / launchOperationD2H"]
+    end
+    POOL[("<b>registered SHM pool</b><br/>host DRAM, DMA-able")]
+    REG --> RH --> REGF
+    CP --> CR
+    CAI --> DMA
+    REGF -.->|"pins window"| POOL
+    DMA <-->|"raw DMA of total_size() bytes"| POOL
+```
+
+</details>
+
 ### 1.1 Why the existing `copy_tensor` is not sufficient
 
 spyre-inference #240 milestone 1 already uses `torch_spyre._C.copy_tensor(src, dst,
