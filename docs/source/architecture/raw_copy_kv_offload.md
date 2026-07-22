@@ -1,43 +1,48 @@
-# Design: Exposing flex raw-copy + shared-host-DMA to Python for KV-cache offload
+# Design: torch-spyre Python surface for flex-owned KV-cache offload
 
 | Field | Value |
 |---|---|
 | Status | Draft |
 | Created | 2026-07-07 |
-| Depends on | flex RFC *Raw Tensor Copy + Shared Host Memory DMA* (`flex:docs/RFCs/RawCopySharedHostMemoryRFC.md`) |
-| Consumers | [spyre-inference #240](https://github.com/torch-spyre/spyre-inference/pull/240) (KV offload), the hmlib shared-memory KV runtime |
-| Related | RFC 0171 (Spyre Device), RFC 0047 (Tiled Tensors), `torch-spyre` PR #2796 / issue #2744 (`copy_tensor_raw`) |
+| Updated | 2026-07-22 |
+| Depends on | flex RFC *flex-owned Shared Host KV Pool (1p0 and 1p5)* (`flex:docs/RFCs/SharedHostKvPoolRFC_v3.md`) |
+| Consumers | [spyre-inference](https://github.com/torch-spyre/spyre-inference) (KV-offload connector / cache policy) |
+| Related | RFC 0171 (Spyre Device), RFC 0047 (Tiled Tensors); supersedes `torch-spyre` PR #2796 / issue #2744 |
 
-## 1. Motivation
+## 1. Scope
 
-The [flex RFC](../rfcs/index.md) makes two primitives first-class in the per-process flex
-runtime:
+The flex RFC (`SharedHostKvPoolRFC_v3.md`) delivers the **mechanism** for a cross-process shared
+KV-cache host pool: `copyRaw` (raw device↔host DMA), `SharedHostPool` (a DMA-able shared-memory data
+pool), and `SharedHostMetadata` (a shared directory with a concurrency protocol). spyre-inference owns
+the **cache policy** (what to offload, when to evict) and the vLLM wiring.
 
-- **`RuntimeStream::copyRaw(host_addr, CompositeAddress*, to_device)`** — a raw
-  (`dci == nullptr`), single-chunk, byte-for-byte host↔device DMA that copies exactly the device
-  allocation's `total_size()`.
-- **`RuntimeStream::registerHostBuffer(base, size)` / `unregisterHostBuffer(base)`** — amortized
-  registration of an *externally-allocated* (e.g. POSIX-SHM / `mmap`'d) host window as a DMA
-  endpoint, so many `copyRaw` calls into that window pay no per-call IOMMU pin.
+**This document specifies only the middle layer: the torch-spyre Python surface** that lets
+spyre-inference drive those flex objects. Per flex RFC §3.1, torch-spyre owns exactly two things:
 
-Those are C++ methods on `flex::RuntimeStream`. This document specifies the **torch-spyre Python
-surface** that exposes them, so that a KV-cache offload plugin
-([spyre-inference](https://github.com/torch-spyre/spyre-inference)) — and specifically an
-hmlib-style shared-memory KV store — can:
+1. **The one irreducible tensor-aware step** — turning a `device("spyre")` tensor into the flex device
+   address (`CompositeAddress`) that a DMA needs. flex has no tensor concept, so this cannot live in
+   flex; spyre-inference should not reach into tensor storage internals, so it does not live there
+   either.
+2. **Thin bindings** — pybind wrappers exposing `copyRaw`, `SharedHostPool`, and `SharedHostMetadata`
+   to Python, so the whole mechanism is reachable through `torch_spyre._C`.
 
-1. Snapshot a device KV page to a host buffer and restore it later (**`copy_tensor_raw`**), and
-2. Make its **own** cross-process shared SHM pool a valid DMA endpoint
-   (**`register_dmable_host_buffer`**), rather than being forced to DMA only into torch-owned CPU
-   tensors.
+Everything else — the SHM segments, DMA pinning, the block-hash→slot directory, the per-slot locks,
+the publish gate, eviction, the raw-copy correctness invariant, and the 1p0/1p5 backend differences —
+is **flex's** and is **not restated here**. Where this doc needs one of those facts it cites the flex
+RFC section rather than reproducing it.
 
-The call path (plugin → torch-spyre → flex → the registered SHM pool):
+The seam between torch-spyre and the layers above and below it is a plain **integer `slot_id`** (flex
+RFC §3.1): spyre-inference names a KV block by slot; torch-spyre passes the slot and a tensor to flex;
+raw host pointers never cross into Python.
+
+The call path (connector → torch-spyre → flex → the shared pool):
 
 <!-- Source: figures/copy-raw-call-path.{mmd,d2}. Regenerate with:
        npx -y -p @mermaid-js/mermaid-cli@10 mmdc -i docs/source/architecture/figures/copy-raw-call-path.mmd \
          -o docs/source/architecture/figures/copy-raw-call-path.svg -b transparent
        d2 docs/source/architecture/figures/copy-raw-call-path.d2 docs/source/architecture/figures/copy-raw-call-path.d2.svg -->
 
-![copy_tensor_raw / register_dmable_host_buffer call path from the plugin through torch-spyre and flex into the registered SHM pool](figures/copy-raw-call-path.svg)
+![copy_tensor_raw call path: the connector names a slot, torch-spyre resolves the device address and forwards to flex copyRaw, and flex DMAs into the flex-owned shared pool](figures/copy-raw-call-path.svg)
 
 <details>
 <summary>Diagram sources (Mermaid at <code>figures/copy-raw-call-path.mmd</code>; D2 at <code>figures/copy-raw-call-path.d2</code>, rendered to <code>copy-raw-call-path.d2.svg</code>)</summary>
@@ -45,169 +50,136 @@ The call path (plugin → torch-spyre → flex → the registered SHM pool):
 ```mermaid
 %%{ init: { "flowchart": { "htmlLabels": true, "curve": "basis" }, "theme": "neutral" } }%%
 flowchart TB
-    subgraph plugin["<b>plugin</b> (spyre-inference / hmlib)"]
+    subgraph conn["<b>spyre-inference</b> (KV connector / cache policy)"]
         direction TB
-        REG["register_dmable_host_buffer(base, nbytes)<br/><i>once, at pool attach</i>"]
-        CP["copy_tensor_raw(host_ptr, host_nbytes,<br/>dev_tensor, to_device)<br/><i>per KV page</i>"]
+        POLICY["decide offload/reload for a KV block;<br/>look up / claim its integer <b>slot_id</b>"]
+        CP["copy_tensor_raw(dev_tensor, pool, slot_id, to_device)<br/><i>per KV page</i>"]
+        POLICY --> CP
     end
     subgraph ts["<b>torch-spyre</b> (torch_spyre._C / SpyreStream)"]
         direction TB
-        RH["registerHostBuffer(base, nbytes)"]
-        CR["SpyreStream::copy_raw<br/>resolve CompositeAddress from SharedOwnerCtx;<br/>assert single_chunk; size = total_size()"]
-        CAI["copyAsyncImpl(host_ptr, composite,<br/>dci = <b>nullptr</b>, to_device)"]
-        CR --> CAI
+        GCA["get_composite_address(dev_tensor)<br/>read CompositeAddress from SharedOwnerCtx"]
+        CR["SpyreStream::copy_raw<br/>forward pool.slot_ptr(slot_id) + composite"]
+        WRAP["SharedHostPool / SharedHostMetadata<br/>pybind passthroughs"]
+        GCA --> CR
     end
-    subgraph flex["<b>flex</b> (RuntimeStream)"]
+    subgraph flex["<b>flex</b> (RuntimeStream + shared pool)"]
         direction TB
-        REGF["registerHostBuffer → IommuMapper::Map<br/>(cache IOVA for the window)"]
-        DMA["createDmaParams(dci=null) →<br/>launchOperationH2D / launchOperationD2H"]
+        COPYRAW["copyRaw(host_addr, composite, to_device)<br/>dci=null; owns size, chunks, invariant"]
+        POOLOBJ["SharedHostPool: SHM segment,<br/>DMA-pinned, slot_ptr(i)"]
+        META["SharedHostMetadata: hash&rarr;slot,<br/>locks, publish/evict"]
     end
-    POOL[("<b>registered SHM pool</b><br/>host DRAM, DMA-able")]
-    REG --> RH --> REGF
+    POOL[("<b>shared host pool</b><br/>host DRAM, DMA-able, addressed by slot i")]
+
     CP --> CR
-    CAI --> DMA
-    REGF -.->|"pins window"| POOL
-    DMA <-->|"raw DMA of total_size() bytes"| POOL
+    CR --> COPYRAW
+    CR -.->|"pool.slot_ptr(slot_id)"| POOLOBJ
+    WRAP -.-> POOLOBJ
+    WRAP -.-> META
+    POOLOBJ -->|"owns / pins"| POOL
+    COPYRAW <-->|"raw DMA of total_size() bytes"| POOL
+
+    classDef conn fill:#fff4e6,stroke:#c1620a,color:#3a2300
+    classDef tsp  fill:#eef5ff,stroke:#3b6fb3,color:#0b2447
+    classDef flx  fill:#e9f7ef,stroke:#1e7d44,color:#06331d
+    classDef mem  fill:#fde8e8,stroke:#a83232,color:#3a0000
+    class POLICY,CP conn
+    class GCA,CR,WRAP tsp
+    class COPYRAW,POOLOBJ,META flx
+    class POOL mem
 ```
 
 </details>
 
-### 1.1 Why the existing `copy_tensor` is not sufficient
+## 2. What already exists in torch-spyre
 
-spyre-inference #240 milestone 1 already uses `torch_spyre._C.copy_tensor(src, dst,
-non_blocking=False)` — `SpyreStream::copyAsync` → flex DMA — to move a device KV page into a
-**torch-owned CPU tensor**. That is the right primitive for single-instance, single-tier host-RAM
-offload. It is **not** sufficient for a cross-instance *shared* pool, for two reasons:
+Two pieces of the surface already have working analogues on `main`; the KV work reuses them rather
+than inventing new machinery.
 
-- **The destination must be a raw pointer into a shared segment, not a `torch.Tensor`.** A shared KV
-  pool is a POSIX-SHM segment mapped by several processes; a slot is addressed by an integer offset,
-  and the bytes are an opaque device-format image (RFC §5 correctness invariant). `copy_tensor`
-  takes two `at::Tensor`s and (via the normal copy path) may apply layout/dtype conversion; KV needs
-  a *raw* copy of `total_size()` bytes to/from `pool_base + slot*slot_bytes`.
-- **The shared window must be pinned for DMA once, not re-pinned per copy.** With `copy_tensor`, the
-  CPU tensor is not a registered DMA endpoint the plugin controls; each transfer implicitly pins.
-  A shared pool is mapped once and DMA'd into for the process lifetime, so registration belongs at
-  attach time (mirrors `cudaHostRegister` vs `cudaMemcpyAsync`).
+- **A tensor↔tensor DMA through flex.** `spyre::spyre_copy_from` (`torch_spyre/csrc/spyre_mem.cpp`)
+  handles `_copy_from` between CPU and `spyre` tensors and drives a flex DMA. This is the *converting*
+  copy (it may apply layout/dtype conversion); the KV path needs the *raw* variant instead (§3.1).
+- **The device address is already resolvable from a tensor.** A `spyre` tensor's storage `data_ptr`
+  carries a `SharedOwnerCtx` (`torch_spyre/csrc/spyre_allocator.h:26`) holding the flex device
+  allocation handle (`owner`). `get_composite_address` (§3.2) is a read-only accessor over exactly
+  this field — no new bookkeeping.
+- **A pooled stream accessor exists.** `getStreamFromPool` / `getCurrentStream`
+  (`torch_spyre/csrc/spyre_stream.{h,cpp}`) already map a `c10::Stream` to a `flex::StreamHandle`.
+  `get_dma_stream` (§3.4) is a thin wrapper so offload/reload can run on a dedicated stream.
 
-Hence two new bindings: a raw copy that accepts a host pointer + device tensor, and an explicit
-register/unregister of an external host window.
-
-## 2. Current state in torch-spyre
-
-`SpyreStream` (`torch_spyre/csrc/spyre_stream.{h,cpp}`) owns the mapping from a `c10::Stream` to a
-`flex::RuntimeStream` handle **and already implements a tensor↔tensor DMA** — `copyAsync` /
-`copyAsyncImpl` are live, not stubs:
-
-```cpp
-// spyre_stream.cpp — today (real)
-void SpyreStream::copyAsync(const at::Tensor& src, const at::Tensor& dst) const {
-  bool host2device = src.is_cpu() && dst.is_privateuseone();
-  bool device2host = src.is_privateuseone() && dst.is_cpu();
-  const at::Tensor* dev_tensor = host2device ? &dst : &src;
-  const at::Tensor* cpu_tensor = host2device ? &src : &dst;
-  void* cpu_ptr = const_cast<void*>(cpu_tensor->storage().data());
-  SpyreTensorLayout stl = get_spyre_tensor_layout(*dev_tensor);
-  auto* ctx = static_cast<SharedOwnerCtx*>(               // holds the CompositeAddress
-      dev_tensor->unsafeGetTensorImpl()->storage().data_ptr().get_context());
-  DataConversionInfo dci = generate_dci(cpu_tensor, dev_tensor, stl,
-                                        cpu_tensor->storage_offset(), host2device);
-  copyAsyncImpl(cpu_ptr, &ctx->composite_addr, &dci, host2device);
-}
-
-void SpyreStream::copyAsyncImpl(void* cpu_ptr,
-                                const flex::CompositeAddress* device_address,
-                                const DataConversionInfo* dci, bool host2device) const {
-  auto dci_ptr = dci ? std::make_shared<data_conversion_info>(*dci) : nullptr;
-  auto* params = flex::createDmaParams(cpu_ptr, device_address->total_size(),
-                                       host2device, device_address, std::move(dci_ptr));
-  host2device ? launchH2D(params) : launchD2H(params);   // -> launchOperation{H2D,D2H}
-  flex::destroyDmaParams(params);
-}
-```
-
-This is already the shape the raw path needs, and it does three of the load-bearing things: it
-extracts the device tensor's `flex::CompositeAddress` from `SharedOwnerCtx`
-(`spyre_allocator.cpp:150`), sizes the DMA by `device_address->total_size()` (the padded/tiled
-physical size, **not** `numel*itemsize`), and dispatches through `flex::createDmaParams` →
-`launchOperationH2D/D2H`. Crucially `copyAsyncImpl` **already accepts a null `dci`**, and
-`createDmaParams` treats `dci == nullptr` as a straight byte copy — so a *raw* copy is
-`copyAsyncImpl` with `dci = nullptr`, no new mechanism.
-
-The public Python entrypoint today is `torch_spyre._C.copy_tensor` (`module.cpp:338` →
-`spyre::spyre_copy_from` → `copyAsync`), which takes two `at::Tensor`s and always builds a real
-`dci` via `generate_dci`. What is missing for a shared SHM KV pool is therefore narrow:
-
-1. a variant that takes a **raw host pointer + length** (a pool slot, not an `at::Tensor`) and passes
-   `dci = nullptr` to `copyAsyncImpl`, and
-2. an explicit **register/pin** of the external host window — there is no `cudaHostRegister`
-   equivalent today, so per-call pinning inside `submitDma` is the only path.
-
-`getStreamFromPool` / `getCurrentStream` already give a pooled `SpyreStream`, so
-`get_dma_stream(device)` is a thin accessor over the existing pool.
+> **Sequencing note.** The flex objects this surface wraps (`copyRaw`, `SharedHostPool`,
+> `SharedHostMetadata`) are **design-only** on the flex `rfc/shared-host-kv-pool` branch today — no C++
+> symbols yet. Independently, flex's public allocation handle is migrating from the current DMPA-based
+> `DeviceMemoryAllocation` to the `CompositeAddress` model the flex architecture docs describe; the
+> `copyRaw(void*, const CompositeAddress*, bool)` signature assumes that migration has landed. So this
+> torch-spyre PR is **ready to write against the flex API, but cannot merge until flex ships the
+> mechanism** (flex RFC §5 steps 1–4). Keeping the tensor→address step behind the single
+> `get_composite_address` accessor is what insulates this surface from the flex handle migration.
 
 ## 3. Proposed torch-spyre surface
 
-Four Python-visible additions (all in `torch_spyre._C`), plus their C++ backing on `SpyreStream`.
+Four Python-visible additions in `torch_spyre._C`, plus their C++ backing. The design principle is
+**thin**: each binding forwards to a flex call and adds no policy.
 
-### 3.1 `copy_tensor_raw` — raw DMA between a host pointer and a device tensor
+### 3.1 `copy_tensor_raw` — raw DMA between a device tensor and a pool slot
 
 ```python
 def copy_tensor_raw(
-    host_ptr: int,            # integer host virtual address (into the plugin's SHM slot)
-    host_nbytes: int,         # bytes available at host_ptr; must be >= dev_tensor total_size()
-    dev_tensor: torch.Tensor, # a device("spyre") tensor whose storage is the KV page
-    to_device: bool,          # True: host_ptr -> device (restore); False: device -> host_ptr (snapshot)
+    dev_tensor: torch.Tensor,   # a device("spyre") tensor whose storage is the KV page
+    pool: SharedHostPool,       # a flex SharedHostPool handle (§3.3)
+    slot_id: int,               # integer slot index within the pool
+    to_device: bool,            # True: slot -> device (reload); False: device -> slot (offload)
     non_blocking: bool = False,
 ) -> None: ...
 ```
 
-Semantics:
+torch-spyre resolves `dev_tensor`'s `CompositeAddress` (§3.2), then calls
+`flex::RuntimeStream::copyRaw(pool.slot_ptr(slot_id), composite_addr, to_device)` on the DMA stream.
+The host address is obtained from the flex pool **inside** the call; it is never surfaced to Python
+(§1 seam). The copy length, chunk handling, and byte-identical-layout guarantee are entirely flex's
+(`copyRaw`, flex RFC §4.1 and Appendix B) — torch-spyre passes the `CompositeAddress` and the slot and
+does **not** compute a size or assert chunk shape.
 
-- Resolves `dev_tensor`'s `CompositeAddress` (see §3.3) and its `total_size()` (the padded, tiled
-  physical byte count — **not** `numel * itemsize`), asserts single-chunk, asserts
-  `host_nbytes >= total_size()`, and calls `RuntimeStream::copyRaw(host_ptr, composite_addr,
-  to_device)` on the current (or a supplied) DMA stream.
-- `non_blocking=False` calls `stream.synchronize()` after enqueue, matching `copy_tensor`'s
-  contract, so callers can treat it as synchronous. `non_blocking=True` returns after enqueue; the
-  caller syncs (or awaits the completion callback) before flipping a slot to VALID.
-- The host pointer **should** fall inside a window previously passed to
-  `register_dmable_host_buffer` (§3.2); if it does not, on 1p0 flex pins per call (correct, slower)
-  and on 1p5 (§7.1 = "no") the call raises.
+`non_blocking=False` calls `stream.synchronize()` after enqueue (matching the existing copy contract);
+`non_blocking=True` returns after enqueue and the caller synchronizes before treating the transfer as
+complete (e.g. before flex flips the slot to `VALID`, flex RFC §4.4).
 
-A tensor-typed convenience overload `copy_tensor_raw(host_tensor: torch.Tensor, dev_tensor,
-to_device, non_blocking=False)` is also provided for callers that already hold a CPU `at::Tensor`
-(it forwards `host_tensor.data_ptr()` and `host_tensor.nbytes`). The pointer form is what the shared
-SHM-pool plugin uses because its slots are not torch tensors.
-
-### 3.2 `register_dmable_host_buffer` / `unregister_dmable_host_buffer`
-
-```python
-def register_dmable_host_buffer(host_ptr: int, nbytes: int, device: torch.device | None = None) -> None: ...
-def unregister_dmable_host_buffer(host_ptr: int, device: torch.device | None = None) -> None: ...
-def dmable_host_buffer_alignment(device: torch.device | None = None) -> int: ...
-```
-
-- `register_dmable_host_buffer(base, nbytes)` → `RuntimeStream::registerHostBuffer(base, nbytes)`
-  on the device's DMA stream. Called **once** by the plugin right after it `mmap`s its shared KV
-  pool. Idempotent per `(device, base, nbytes)`. On 1p0 this pins the whole window via the IOMMU
-  mapper and caches the IOVA; on 1p5 it requires the senlib external-pointer pin (flex RFC §7.1) and
-  raises `HostBufferNotRegisterable` if unavailable — the signal for the plugin to instead source
-  its pool from a flex-owned `SharedHostPool` (flex RFC §4.4).
-- `dmable_host_buffer_alignment()` → `RuntimeStream::getIovaAlignment()`. The plugin aligns its pool
-  base and per-slot stride to this to avoid the 1p0 unaligned shadow-buffer fallback.
-
-### 3.3 `get_composite_address` — the device-side handle a raw copy needs
+### 3.2 `get_composite_address` — the one tensor-aware step
 
 ```python
 def get_composite_address(dev_tensor: torch.Tensor) -> CompositeAddressHandle: ...
 ```
 
-Returns an opaque handle wrapping the `flex::CompositeAddress*` that backs `dev_tensor`'s storage —
-the `ctx->composite_addr` on the `SharedOwnerCtx` held by the tensor's storage `data_ptr` context
-(created in `spyre_allocator.cpp:150`), i.e. the exact value `copyAsync` reads today (§2). It is
-consumed by `copy_tensor_raw` internally; it is exposed so a plugin can (a) assert single-chunk up
-front and (b) cache the handle per registered KV page rather than re-resolving it on every transfer.
-The handle holds no ownership and is invalidated if the tensor's storage is freed.
+Returns an opaque handle wrapping the `flex::CompositeAddress` that backs `dev_tensor`'s storage —
+the handle held by the tensor's `SharedOwnerCtx` (`torch_spyre/csrc/spyre_allocator.h:26`). This is
+the **only** binding that touches tensor internals, and it is the step flex RFC §3.1 explicitly places
+in torch-spyre. It is consumed by `copy_tensor_raw` internally, and exposed so spyre-inference can
+cache the handle per KV page instead of re-resolving it every transfer. The handle holds no ownership
+and is invalidated when the tensor's storage is freed.
+
+### 3.3 `SharedHostPool` / `SharedHostMetadata` — pybind wrappers over the flex objects
+
+```python
+class SharedHostPool:
+    @staticmethod
+    def create_or_attach(
+        stream: SpyreStreamHandle, name: str, num_slots: int, slot_bytes: int
+    ) -> "SharedHostPool": ...
+    def slot_count(self) -> int: ...
+    def slot_bytes(self) -> int: ...
+    # slot_ptr is intentionally NOT exposed to Python (§1 seam); copy_tensor_raw uses it in C++.
+
+class SharedHostMetadata:
+    @staticmethod
+    def create_or_attach(name: str, num_slots: int, max_chunks: int) -> "SharedHostMetadata": ...
+    # lookup / claim / publish / evict / generation-checked pin, per flex RFC §4.3–§4.4.
+```
+
+These are **one-to-one pybind exposures of the flex classes** (flex RFC §4.2, §4.3) so spyre-inference
+reaches the whole mechanism through `torch_spyre._C`. torch-spyre adds nothing to them — no SHM
+creation of its own, no locking, no directory logic. The exact method set on `SharedHostMetadata`
+tracks the flex header once it lands; the binding is a passthrough. Which layer *calls* these (the
+spyre-inference connector) and the eviction policy are out of torch-spyre scope (flex RFC §3.1, §3.4).
 
 ### 3.4 `get_dma_stream` — the pooled stream to issue copies on
 
@@ -215,99 +187,70 @@ The handle holds no ownership and is invalidated if the tensor's storage is free
 def get_dma_stream(device: torch.device | None = None) -> SpyreStreamHandle: ...
 ```
 
-Thin wrapper over `getStreamFromPool(device, priority=0)`. Lets the plugin keep a dedicated
-low-priority DMA stream so offload/reload overlaps the compute stream once async is enabled
-(today everything is synchronous; async is a follow-up — see §6). All the `copy_tensor_raw` /
-`register_dmable_host_buffer` calls above accept an optional explicit stream; when omitted they use
-the current stream for the device.
+Thin wrapper over `getStreamFromPool(device, priority=0)` so the connector can keep a dedicated DMA
+stream, letting offload/reload overlap the compute stream once async lands (§5). `copy_tensor_raw` and
+`SharedHostPool.create_or_attach` accept an optional explicit stream; when omitted they use the
+current stream for the device.
 
-## 4. C++ implementation sketch
+## 4. C++ backing
 
-All four land on `SpyreStream`, and `copy_raw` **reuses the existing `copyAsyncImpl`** (§2) — the
-only change is passing `dci = nullptr` and taking the host pointer + device `CompositeAddress`
-directly instead of deriving them from two tensors.
-
-```cpp
-// spyre_stream.h — additions
-void copy_raw(void* host_ptr, size_t host_nbytes,
-              const at::Tensor& dev_tensor, bool to_device,
-              bool non_blocking) const;
-
-void register_host_buffer(void* base, size_t nbytes) const;    // -> flex registerHostBuffer
-void unregister_host_buffer(void* base) const;                 // -> flex unregisterHostBuffer
-size_t iova_alignment() const;                                 // -> flex getIovaAlignment
-```
-
-`copy_raw` body — resolve the same `CompositeAddress` `copyAsync` uses, then call the existing
-`copyAsyncImpl` with a null `dci`:
+`copy_tensor_raw`'s backing resolves the same `SharedOwnerCtx` device handle the existing copy path
+uses, then calls the new flex `copyRaw` with a null `dci`. Sketch (names align with the flex API once
+it lands):
 
 ```cpp
-void SpyreStream::copy_raw(void* host_ptr, size_t host_nbytes,
-                           const at::Tensor& dev_tensor, bool to_device,
-                           bool non_blocking) const {
-  auto* spyre_impl = static_cast<SpyreTensorImpl*>(dev_tensor.unsafeGetTensorImpl());
+// torch_spyre/csrc/spyre_stream.{h,cpp} — new method
+void SpyreStream::copy_raw(const at::Tensor& dev_tensor,
+                           flex::SharedHostPool* pool, uint64_t slot_id,
+                           bool to_device, bool non_blocking) const {
   auto* ctx = static_cast<SharedOwnerCtx*>(
-      spyre_impl->storage().data_ptr().get_context());        // same source as copyAsync
-  const flex::CompositeAddress* composite = &ctx->composite_addr;
-  TORCH_CHECK(composite->is_single_chunk(),
-              "copy_tensor_raw requires a single-chunk device allocation");
-  TORCH_CHECK(host_nbytes >= composite->total_size(),
-              "host buffer (", host_nbytes, " B) smaller than device total_size() (",
-              composite->total_size(), " B)");
+      dev_tensor.unsafeGetTensorImpl()->storage().data_ptr().get_context());
+  const flex::CompositeAddress* composite = get_composite_address(*ctx);  // §3.2
 
-  copyAsyncImpl(host_ptr, composite, /*dci=*/nullptr, to_device);   // raw: dci == nullptr
+  // flex owns size, chunk handling, and the byte-identical-layout invariant (flex RFC §4.1, App. B).
+  resolveRuntimeHandle()->copyRaw(pool->slot_ptr(slot_id), composite, to_device);
+
   if (!non_blocking) resolveRuntimeHandle()->synchronize();
 }
 ```
 
-`register_host_buffer` / `unregister_host_buffer` / `iova_alignment` forward one-to-one to the new
-flex `RuntimeStream` methods (via `resolveRuntimeHandle()`). `get_composite_address` (§3.3) exposes
-the same `ctx->composite_addr` used above. All bindings go next to `copy_tensor` in
-`torch_spyre/csrc/module.cpp:338`.
+`SharedHostPool` / `SharedHostMetadata` bindings are pybind passthroughs to the flex classes.
+`get_composite_address` returns the handle from `SharedOwnerCtx`. All bindings sit next to the existing
+copy/stream bindings in `torch_spyre/csrc/module.cpp`.
 
 ### 4.1 Ownership and lifetime
 
-- torch-spyre **never** allocates or maps the shared pool and **never** touches the block-hash→slot
-  directory, the cross-process lock, or the publish gate. Those are the plugin's (flex RFC §6). The
-  torch-spyre surface is exactly: resolve the device handle, register/pin a host window, issue the
-  raw DMA, sync.
-- A registered window's IOVA lives as long as the `RuntimeStream` (per-process). The plugin is
-  expected to `unregister_dmable_host_buffer` on pool teardown; process exit tears the per-process
-  IOMMU table down regardless.
+- torch-spyre **never** allocates or maps a shared segment, **never** pins host memory, and **never**
+  touches the directory, per-slot locks, or publish gate. Those are flex's (flex RFC §4.2–§4.4). The
+  torch-spyre surface is exactly: resolve the device handle, forward a raw DMA, wrap the flex objects.
+- The `SharedHostPool` / `SharedHostMetadata` Python objects hold flex handles; their lifetime (attach
+  refcount, `shm_unlink` on last-out) is flex's (flex RFC §4.2). torch-spyre just holds the handle for
+  as long as the Python object is alive.
 
-## 5. Correctness invariants (carried from the flex RFC)
+## 5. Out of scope / follow-ups
 
-- **Copy `total_size()`, never `numel * itemsize`.** Device tiling + 128-byte stick alignment make
-  the physical size larger than the logical size; copying the logical size truncates the tiled tail
-  and corrupts reload. `copy_tensor_raw` derives the length from `CompositeAddress::total_size()`
-  and ignores the tensor's logical byte count.
-- **Single-chunk only.** Asserted at every `copy_tensor_raw`. Multi-chunk (`Interleave`) is out of
-  scope and already rejected by the UMI scheduler.
-- **Same `(shape, dtype)` ⇒ byte-identical on-card layout.** A page snapshotted from one KV slot can
-  be restored into any other same-`(shape, dtype)` slot. This is what makes a shared, content-hashed
-  pool sound (holds for one model; re-open if KV ever allocates multi-chunk).
-
-## 6. Out of scope / follow-ups
-
-- **Async / batched raw copy.** M1 keeps everything synchronous (`non_blocking=False`). An async path
-  that overlaps offload with compute depends on the torch-spyre stream/event story maturing (RFC 0171
-  open question) and would extend `copy_tensor_raw` with a completion-event return; tracked separately.
-- **1p5 external-pointer pin.** `register_dmable_host_buffer` on 1p5 depends on senlib 1.5 being able
-  to pin an external mmap'd pointer (flex RFC §7.1). Until resolved, 1p5 users fall back to a
-  flex-owned `SharedHostPool`; this doc's Python surface is unchanged either way (only the backing of
-  `register_dmable_host_buffer` differs).
-- **Stable on-device KV descriptor.** `get_composite_address` returns a handle tied to a live tensor.
-  A descriptor independent of an allocated tensor (for a future direct device↔storage path) is a
+- **Cache policy and connector wiring** — offload/reload decisions, eviction, tiering (flex RFC §2.2)
+  live in spyre-inference, not here.
+- **Async / batched raw copy** — the first cut keeps `non_blocking=False`. Overlapping offload with
+  compute depends on the torch-spyre stream/event story maturing and would extend `copy_tensor_raw`
+  with a completion event; tracked separately.
+- **1p5 backing selection** — whether the flex pool is a DMA-able handle or a pinned external SHM
+  pointer is a flex decision (flex RFC §4.2, §6.1). **This Python surface is unchanged either way** —
+  it names a pool and a slot; only flex's backing differs.
+- **Stable device KV descriptor** — `get_composite_address` returns a handle tied to a live tensor. A
+  descriptor independent of an allocated tensor (for a future direct device↔storage path) is a
   separate design.
 
-## 7. Acceptance
+## 6. Acceptance
 
-- [ ] `torch_spyre._C.copy_tensor_raw` round-trips a device KV page through a plain `mmap` host
-      buffer: allocate a `device("spyre")` tensor with a known fp16 pattern, `copy_tensor_raw(..., to_device=False)`
-      into the mmap buffer, zero the tensor, `copy_tensor_raw(..., to_device=True)` back, assert equal.
-- [ ] Restoring a snapshot into a **different** same-`(shape, dtype)` tensor reproduces the pattern
-      (the flex RFC §9 round-trip test, driven from Python).
-- [ ] `register_dmable_host_buffer` over a large mmap window followed by many `copy_tensor_raw` calls
-      issues **zero** per-call IOMMU pins on 1p0 (verified via flex counters / trace).
-- [ ] `copy_tensor_raw` with `host_nbytes < total_size()` raises, and with a multi-chunk tensor raises.
-- [ ] Existing `copy_tensor` path and the M1 offload tests are unaffected.
+- [ ] `torch_spyre._C.copy_tensor_raw` round-trips a device KV page through a flex `SharedHostPool`
+      slot: allocate a `device("spyre")` tensor with a known fp16 pattern, offload
+      (`to_device=False`), zero the tensor, reload (`to_device=True`), assert equal.
+- [ ] Reloading a slot into a **different** same-`(shape, dtype)` tensor reproduces the pattern
+      (drives the flex round-trip test, flex RFC §5, from Python).
+- [ ] `get_composite_address` returns a handle whose reported chunk shape matches the tensor's
+      allocation, and is rejected after the tensor's storage is freed.
+- [ ] `SharedHostPool` / `SharedHostMetadata` create-or-attach from two processes see the same slots
+      (two-instance produce→consume, driven from Python).
+- [ ] The existing `copy_tensor` / `_copy_from` path is unaffected.
+```

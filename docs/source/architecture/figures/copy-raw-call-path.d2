@@ -1,36 +1,40 @@
 direction: down
 
-plugin: plugin (spyre-inference / hmlib) {
+conn: spyre-inference (KV connector / cache policy) {
   style.fill: "#fff4e6"
   style.stroke: "#c1620a"
-  REG: "register_dmable_host_buffer(base, nbytes)\n(once, at pool attach)"
-  CP: "copy_tensor_raw(host_ptr, host_nbytes,\ndev_tensor, to_device)\n(per KV page)"
+  POLICY: "decide offload/reload for a KV block;\nlook up / claim its integer slot_id"
+  CP: "copy_tensor_raw(dev_tensor, pool, slot_id, to_device)\n(per KV page)"
+  POLICY -> CP
 }
 
 ts: torch-spyre (torch_spyre._C / SpyreStream) {
   style.fill: "#eef5ff"
   style.stroke: "#3b6fb3"
-  RH: "registerHostBuffer(base, nbytes)"
-  CR: "SpyreStream::copy_raw\nresolve CompositeAddress from SharedOwnerCtx;\nassert single_chunk; size = total_size()"
-  CAI: "copyAsyncImpl(host_ptr, composite,\ndci = nullptr, to_device)"
-  CR -> CAI
+  GCA: "get_composite_address(dev_tensor)\nread CompositeAddress from SharedOwnerCtx"
+  CR: "SpyreStream::copy_raw\nforward pool.slot_ptr(slot_id) + composite"
+  WRAP: "SharedHostPool / SharedHostMetadata\npybind passthroughs"
+  GCA -> CR
 }
 
-flex: flex (RuntimeStream) {
+flex: flex (RuntimeStream + shared pool) {
   style.fill: "#e9f7ef"
   style.stroke: "#1e7d44"
-  REGF: "registerHostBuffer -> IommuMapper::Map\n(cache IOVA for the window)"
-  DMA: "createDmaParams(dci=null) ->\nlaunchOperationH2D / launchOperationD2H"
+  COPYRAW: "copyRaw(host_addr, composite, to_device)\ndci=null; owns size, chunks, invariant"
+  POOLOBJ: "SharedHostPool: SHM segment,\nDMA-pinned, slot_ptr(i)"
+  META: "SharedHostMetadata: hash->slot,\nlocks, publish/evict"
 }
 
-POOL: "registered SHM pool\nhost DRAM, DMA-able" {
+POOL: "shared host pool\nhost DRAM, DMA-able, addressed by slot i" {
   shape: cylinder
   style.fill: "#fde8e8"
   style.stroke: "#a83232"
 }
 
-plugin.REG -> ts.RH -> flex.REGF
-plugin.CP -> ts.CR
-ts.CAI -> flex.DMA
-flex.REGF -> POOL: "pins window" { style.stroke-dash: 3 }
-flex.DMA <-> POOL: "raw DMA of total_size() bytes"
+conn.CP -> ts.CR
+ts.CR -> flex.COPYRAW
+ts.CR -> flex.POOLOBJ: "pool.slot_ptr(slot_id)" { style.stroke-dash: 3 }
+ts.WRAP -> flex.POOLOBJ { style.stroke-dash: 3 }
+ts.WRAP -> flex.META { style.stroke-dash: 3 }
+flex.POOLOBJ -> POOL: "owns / pins"
+flex.COPYRAW <-> POOL: "raw DMA of total_size() bytes"
