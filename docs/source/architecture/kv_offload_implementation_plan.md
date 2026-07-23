@@ -34,9 +34,10 @@ Three design documents describe a three-layer KV-cache offload stack:
    `SpyreOffloadingSpec` and handlers that ride the upstream `OffloadingConnector`.
 
 This document turns those designs into a concrete, dependency-ordered issue backlog:
-**3 design-doc epics + 2 milestone epics + 16 implementation sub-issues = 21 issues**,
-all created in `torch-spyre`, all labeled `kvc-offloading`, all added to project
-board view 23.
+**3 epics (1 design + 2 milestone) + 18 sub-issues (3 design-doc + 15 implementation)
+= 21 issues**, all created in `torch-spyre`, all labeled `kvc-offloading`, all added to
+project board view 23. The three design docs are one deliverable, so they sit as three
+sub-issues under a single **design epic** (one RFC-merge PR per layer).
 
 ## 2. Current code status (grounds the scoping)
 
@@ -79,14 +80,13 @@ issues.
 
 ## 4. Epics
 
-Five epics. The three design-doc epics each merge one RFC (one PR, one layer). The two
-milestone epics track the implementation sub-issues.
+Three epics. **The design work is one epic (E-DESIGN)** whose three sub-issues each
+merge one RFC (one PR, one layer) — the three design docs are a single deliverable, not
+three separate epics. The two milestone epics track the implementation sub-issues.
 
 | ID | Title | Milestone | Closes with |
 |---|---|---|---|
-| **E1** | `[Epic] RFC: shared host memory KV pool (hardware-runtime raw copy + shared pool + directory)` | design | Merge the hardware-runtime shared-host-pool RFC |
-| **E2** | `[Epic] Design: torch-spyre Python surface for KV-cache offload` | design | Merge `docs/source/architecture/raw_copy_kv_offload.md` + figures |
-| **E3** | `[Epic] RFC: port the upstream KV connector to spyre-inference` | design | Merge the spyre-inference upstream-connector-port RFC + figures |
+| **E-DESIGN** | `[Epic] KV-cache offload design docs (runtime + torch-spyre + spyre-inference)` | design | All three E-D* design sub-issues (§5.0) merged |
 | **M1** | `[Epic] Milestone 1 — per-instance host-RAM KV offload end-to-end` | M1 (Jul 2026) | All M1-* sub-issues closed; M1 acceptance `vllm serve` green |
 | **M2** | `[Epic] Milestone 2 — cross-instance shared host-memory KV pool` | M2 (Aug 2026) | All M2-* sub-issues closed; M2 acceptance (two-instance peer hit) green |
 
@@ -96,6 +96,41 @@ Every sub-issue below is one PR in one repo. **Layer** names the repo the PR lan
 (hardware-runtime / torch-spyre / spyre-inference). All issues are *filed* in
 `torch-spyre` and labeled `kvc-offloading`; the "layer" tells the implementer which
 codebase the PR targets.
+
+### 5.0 Design epic (E-DESIGN) — 3 sub-issues
+
+The three design docs are a single deliverable under **E-DESIGN**; each sub-issue is one
+RFC-merge PR in one layer. They are independent of each other and of the milestone work.
+
+#### E-D1 — merge the hardware-runtime shared host memory KV pool RFC
+
+- **Layer:** hardware runtime
+- **Epic:** E-DESIGN
+- **Label:** `kvc-offloading`
+- **Blocked by:** none
+- **Description:** Merge the RFC that specifies the mechanism — the byte-exact raw copy
+  primitive, the DMA-able shared host memory pool (slot-addressed), and the
+  block-hash → slot directory with its concurrency protocol.
+
+#### E-D2 — merge the torch-spyre Python-surface design doc
+
+- **Layer:** torch-spyre
+- **Epic:** E-DESIGN
+- **Label:** `kvc-offloading`
+- **Blocked by:** none
+- **Description:** Merge `docs/source/architecture/raw_copy_kv_offload.md` (plus its
+  figures) — the torch-spyre surface: the one tensor-aware address step and the thin
+  bindings over the runtime's raw copy, pool, and directory.
+
+#### E-D3 — merge the spyre-inference upstream-connector-port RFC
+
+- **Layer:** spyre-inference
+- **Epic:** E-DESIGN
+- **Label:** `kvc-offloading`
+- **Blocked by:** none
+- **Description:** Merge the RFC (plus figures) that ports the upstream
+  `OffloadingConnector` experience to spyre-inference — `SpyreOffloadingSpec`, handlers,
+  and the M1/M2 milestone ladder.
 
 ### 5.1 Milestone 1 — 7 sub-issues
 
@@ -362,8 +397,8 @@ codebase the PR targets.
 ## 6. Dependency graph
 
 ```text
-DESIGN EPICS (independent, one PR each):
-  E1 (runtime RFC)   E2 (torch-spyre design)   E3 (spyre-inference RFC)
+E-DESIGN epic (3 sub-issues, independent, one RFC-merge PR each):
+  E-D1 (runtime RFC)   E-D2 (torch-spyre design)   E-D3 (spyre-inference RFC)
 
 MILESTONE 1  (due Jul 2026)
   M1-F1 ─┐                         (runtime: public raw copy)
@@ -389,25 +424,26 @@ MILESTONE 2  (due Aug 2026)
 
 ## 7. Issue counts
 
-| Layer | Design epic | M1 subs | M2 subs |
+| Layer | Design subs | M1 subs | M2 subs |
 |---|---|---|---|
-| hardware runtime | E1 | 1 (M1-F1) | 4 (M2-F1…F4) |
-| torch-spyre | E2 | 3 (M1-T1…T3) | 2 (M2-T1,T2) |
-| spyre-inference | E3 | 3 (M1-S1…S3) | 3 (M2-S1…S3) |
-| milestone epics | — | M1 epic | M2 epic |
+| hardware runtime | 1 (E-D1) | 1 (M1-F1) | 4 (M2-F1…F4) |
+| torch-spyre | 1 (E-D2) | 3 (M1-T1…T3) | 2 (M2-T1,T2) |
+| spyre-inference | 1 (E-D3) | 3 (M1-S1…S3) | 3 (M2-S1…S3) |
 
-**Total: 21 issues** — 3 design epics + 2 milestone epics + 7 M1 subs + 9 M2 subs.
-All created in `torch-spyre`, all labeled `kvc-offloading`, all added to project
-board view 23.
+Plus **3 epics**: E-DESIGN, M1, M2.
+
+**Total: 21 issues** — 3 epics (1 design + 2 milestone) + 3 design subs + 7 M1 subs +
+9 M2 subs (18 sub-issues). All created in `torch-spyre`, all labeled `kvc-offloading`,
+all added to project board view 23.
 
 ## 8. Creation procedure (for when we proceed)
 
-1. Create the 5 epics (E1, E2, E3, M1, M2) in `torch-spyre` with the `kvc-offloading`
+1. Create the 3 epics (E-DESIGN, M1, M2) in `torch-spyre` with the `kvc-offloading`
    label; spot-check.
-2. Create the 16 sub-issues, each referencing its milestone epic and listing its
-   `Blocked by` / `Blocks` from §5 in the body (GitHub issues do not enforce
-   dependencies natively — encode them as `Blocked by #NNN` lines and/or project-board
-   relations).
+2. Create the 18 sub-issues (3 design + 15 implementation), each referencing its epic
+   (E-DESIGN for E-D*, the milestone epic for M1-*/M2-*) and listing its `Blocked by` /
+   `Blocks` from §5 in the body (GitHub issues do not enforce dependencies natively —
+   encode them as `Blocked by #NNN` lines and/or project-board relations).
 3. Set the two milestones (M1 → July 2026, M2 → August 2026) and assign every sub-issue
    to its milestone.
 4. Add all 21 issues to [project board view 23](https://github.com/orgs/torch-spyre/projects/2/views/23).
