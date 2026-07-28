@@ -4,14 +4,14 @@
 |---|---|
 | Status | Draft |
 | Created | 2026-07-07 |
-| Updated | 2026-07-22 |
-| Depends on | flex RFC *flex-owned Shared Host KV Pool (1p0 and 1p5)* (`flex:docs/RFCs/SharedHostKvPoolRFC_v3.md`) |
+| Updated | 2026-07-28 |
+| Depends on | flex RFC *flex-owned Shared Host KV Pool (1p0 and 1p5)* (`flex:docs/RFCs/SharedHostKvPoolRFC.md`) |
 | Consumers | [spyre-inference](https://github.com/torch-spyre/spyre-inference) (KV-offload connector / cache policy) |
 | Related | RFC 0171 (Spyre Device), RFC 0047 (Tiled Tensors); supersedes `torch-spyre` PR #2796 / issue #2744 |
 
 ## 1. Scope
 
-The flex RFC (`SharedHostKvPoolRFC_v3.md`) delivers the **mechanism** for a cross-process shared
+The flex RFC (`SharedHostKvPoolRFC.md`) delivers the **mechanism** for a cross-process shared
 KV-cache host pool: `copyRaw` (raw device↔host DMA), `SharedHostPool` (a DMA-able shared-memory data
 pool), and `SharedHostMetadata` (a shared directory with a concurrency protocol). spyre-inference owns
 the **cache policy** (what to offload, when to evict) and the vLLM wiring.
@@ -100,21 +100,24 @@ than inventing new machinery.
   handles `_copy_from` between CPU and `spyre` tensors and drives a flex DMA. This is the *converting*
   copy (it may apply layout/dtype conversion); the KV path needs the *raw* variant instead (§3.1).
 - **The device address is already resolvable from a tensor.** A `spyre` tensor's storage `data_ptr`
-  carries a `SharedOwnerCtx` (`torch_spyre/csrc/spyre_allocator.h:26`) holding the flex device
-  allocation handle (`owner`). `get_composite_address` (§3.2) is a read-only accessor over exactly
-  this field — no new bookkeeping.
+  carries a `SharedOwnerCtx` (`torch_spyre/csrc/spyre_allocator.h:26`) holding the tensor's
+  `flex::CompositeAddress` (`ctx->composite_addr`) — the same field `copyAsync`, `job_plan.cpp`, and
+  `spyre_ccl.cpp` already read on `main`. `get_composite_address` (§3.2) is a read-only accessor over
+  exactly this field — no new bookkeeping.
 - **A pooled stream accessor exists.** `getStreamFromPool` / `getCurrentStream`
   (`torch_spyre/csrc/spyre_stream.{h,cpp}`) already map a `c10::Stream` to a `flex::StreamHandle`.
   `get_dma_stream` (§3.4) is a thin wrapper so offload/reload can run on a dedicated stream.
 
-> **Sequencing note.** The flex objects this surface wraps (`copyRaw`, `SharedHostPool`,
-> `SharedHostMetadata`) are **design-only** on the flex `rfc/shared-host-kv-pool` branch today — no C++
-> symbols yet. Independently, flex's public allocation handle is migrating from the current DMPA-based
-> `DeviceMemoryAllocation` to the `CompositeAddress` model the flex architecture docs describe; the
-> `copyRaw(void*, const CompositeAddress*, bool)` signature assumes that migration has landed. So this
-> torch-spyre PR is **ready to write against the flex API, but cannot merge until flex ships the
-> mechanism** (flex RFC §5 steps 1–4). Keeping the tensor→address step behind the single
-> `get_composite_address` accessor is what insulates this surface from the flex handle migration.
+> **Sequencing note.** `flex::CompositeAddress` — the device-address type `copy_tensor_raw` resolves
+> and forwards — **already exists on flex `main`** (`total_size()`, `is_single_chunk()`, an ordered
+> list of `Chunk{addr, size, domain_id}`; flex RFC Appendix A). There is **no pending address-handle
+> migration** this surface waits on, and `copyRaw` is, in the flex RFC's words, "a thin public method
+> that names an **existing** code path" (a `dci == nullptr` byte copy; flex RFC §4.1). What is missing
+> is only that flex has not yet *published* the three objects this surface wraps (`copyRaw`,
+> `SharedHostPool`, `SharedHostMetadata`). So this torch-spyre PR is **ready to write against the flex
+> API, but cannot merge until flex ships the mechanism** (flex RFC §5 steps 1–4). Keeping the
+> tensor→address step behind the single `get_composite_address` accessor still insulates this surface
+> from any later change to how flex hands out that address.
 
 ## 3. Proposed torch-spyre surface
 
@@ -139,6 +142,14 @@ The host address is obtained from the flex pool **inside** the call; it is never
 (§1 seam). The copy length, chunk handling, and byte-identical-layout guarantee are entirely flex's
 (`copyRaw`, flex RFC §4.1 and Appendix B) — torch-spyre passes the `CompositeAddress` and the slot and
 does **not** compute a size or assert chunk shape.
+
+In particular, a KV page may span multiple device domains (multi-chunk on 1p5); on offload flex packs
+the chunks contiguously into the slot and records a `{num_chunks, [{domain_id, size}]}` descriptor into
+**its own** `SharedHostMetadata`, then rebuilds a fresh `CompositeAddress` from that descriptor on
+reload (flex RFC §4.1, §4.3). That descriptor is a flex-internal type; **torch-spyre never serializes
+or reconstructs chunk shape** — it forwards the tensor's `CompositeAddress` handle and lets flex own
+the pack/rebuild. Single-chunk (1p0 `Bind`) is the degenerate `num_chunks == 1` case, no longer a
+torch-spyre-enforced restriction.
 
 `non_blocking=False` calls `stream.synchronize()` after enqueue (matching the existing copy contract);
 `non_blocking=True` returns after enqueue and the caller synchronizes before treating the transfer as
@@ -180,6 +191,19 @@ reaches the whole mechanism through `torch_spyre._C`. torch-spyre adds nothing t
 creation of its own, no locking, no directory logic. The exact method set on `SharedHostMetadata`
 tracks the flex header once it lands; the binding is a passthrough. Which layer *calls* these (the
 spyre-inference connector) and the eviction policy are out of torch-spyre scope (flex RFC §3.1, §3.4).
+
+Two flex facts the passthrough inherits (torch-spyre does not implement either):
+
+- **Pinning is internal to the pool; there is no host-buffer-registration binding.** flex pins the
+  whole pool once per IOMMU Function *inside* `SharedHostPool.create_or_attach` (flex RFC §4.2), and
+  the RFC is explicit that "all shared KV host memory comes from a flex `SharedHostPool`; there is no
+  caller-owned-buffer path" (§3.1). So this surface deliberately exposes **no** `register_host_buffer`
+  equivalent — a KV page is DMA-able because it is a pool slot, not because Python registered it.
+- **The metadata segment is mapped at a common virtual base; the data pool is not.** flex maps
+  `SharedHostMetadata` at the same virtual base in every instance so its internals can be pointer-based,
+  whereas `SharedHostPool` is index-addressed and needs no common base (flex RFC §3.2, §4.3, §6.9). The
+  `SharedHostMetadata.create_or_attach` signature above may therefore gain a common-base argument once
+  the flex header lands; the binding tracks flex and adds no base logic of its own.
 
 ### 3.4 `get_dma_stream` — the pooled stream to issue copies on
 
@@ -229,8 +253,9 @@ copy/stream bindings in `torch_spyre/csrc/module.cpp`.
 
 ## 5. Out of scope / follow-ups
 
-- **Cache policy and connector wiring** — offload/reload decisions, eviction, tiering (flex RFC §2.2)
-  live in spyre-inference, not here.
+- **Cache policy and connector wiring** — offload/reload decisions, eviction *policy*, tiering (flex
+  RFC §3.1, §3.4) live in spyre-inference, not here. flex owns the eviction *mechanism* (recycle a
+  slot, bump `generation`); torch-spyre owns neither.
 - **Async / batched raw copy** — the first cut keeps `non_blocking=False`. Overlapping offload with
   compute depends on the torch-spyre stream/event story maturing and would extend `copy_tensor_raw`
   with a completion event; tracked separately.
@@ -252,5 +277,9 @@ copy/stream bindings in `torch_spyre/csrc/module.cpp`.
       allocation, and is rejected after the tensor's storage is freed.
 - [ ] `SharedHostPool` / `SharedHostMetadata` create-or-attach from two processes see the same slots
       (two-instance produce→consume, driven from Python).
+- [ ] A **multi-chunk** device KV page (a tensor whose `CompositeAddress` spans more than one domain)
+      round-trips through a single slot: the pack-on-offload / rebuild-on-reload is flex's, so from
+      Python the assertion is identical to the single-chunk case — `copy_tensor_raw` is called the same
+      way and torch-spyre never inspects `num_chunks`.
 - [ ] The existing `copy_tensor` / `_copy_from` path is unaffected.
 ```
