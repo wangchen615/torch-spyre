@@ -116,7 +116,7 @@ design.
 
 ### Prerequisites (block all of M1)
 
-- [ ] **M1-P1: Env — custom-built flex + torch-spyre + spyre-inference (reproducible, pinned)**
+- [ ] **M1-P1: Env — custom-built hardware runtime + torch-spyre + spyre-inference (reproducible, pinned)**
 - [ ] **M1-P2: spyre-inference recomputation baseline on latest code + pin a version**
 - [ ] **M1-P3: Define the host CPU buffer/tensor model for raw copy (before M1-F1)**
 
@@ -169,7 +169,7 @@ with **one raw DMA and no serialization** — at memory speed, no disk. Reuses M
 pool object and canonical copy path **unchanged**; adds the cross-instance layer: a
 `SharedHostMetadata` block-hash→slot directory, a per-slot concurrency/generation protocol
 with a publish-on-DMA-completion gate (a stale or mid-write slot degrades to a **cache
-miss, never torn bytes**), the multi-chunk (1p5) raw-copy path, and the
+miss, never torn bytes**), the multi-chunk raw-copy path, and the
 `SpyreSharedOffloadingSpec` connector wiring. Gated on the directory, the concurrency
 protocol, and the multi-chunk copy landing. M2 targets the correctness **baseline**; a
 dedicated DMA stream (overlap optimization) is **deferred to the backlog** (M2-T2), not part
@@ -179,7 +179,7 @@ of M2.
 
 - [ ] **M2-F1: `SharedHostMetadata` — block-hash → slot directory**
 - [ ] **M2-F2: Concurrency protocol (locks + generation + publish gate) — full race coverage**
-- [ ] **M2-F3: `copyRaw` multi-chunk (1p5) + cross-process slot round-trip**
+- [ ] **M2-F3: `copyRaw` multi-chunk + cross-process slot round-trip**
 
 ### torch-spyre
 
@@ -311,15 +311,15 @@ ladder.
 
 ---
 
-## M1-P1 — Env: custom-built flex + torch-spyre + spyre-inference (reproducible, pinned)
+## M1-P1 — Env: custom-built hardware runtime + torch-spyre + spyre-inference (reproducible, pinned)
 
-**Title:** `[M1-P1] Prereq: reproducible custom-built flex + torch-spyre + spyre-inference env`
+**Title:** `[M1-P1] Prereq: reproducible custom-built hardware runtime + torch-spyre + spyre-inference env`
 **Labels:** `kvc-offloading` · **Milestone:** M1 (end Aug 2026) · **Epic:** #\<M1>
 
 **Body:**
 
 **Summary:** Stand up a reproducible development/test environment with **custom builds** of all
-three layers — the hardware runtime (flex), torch-spyre, and spyre-inference — pinned together
+three layers — the hardware runtime, torch-spyre, and spyre-inference — pinned together
 so KV-offload work is developed and tested against a known-good stack. This is a prerequisite
 for *everything* in M1: no raw-copy, pool, or connector work can be verified without it.
 
@@ -341,7 +341,7 @@ for *everything* in M1: no raw-copy, pool, or connector work can be verified wit
 
 **Acceptance**
 
-- [ ] Documented, repeatable build of custom flex + torch-spyre + spyre-inference on a Spyre
+- [ ] Documented, repeatable build of custom hardware runtime + torch-spyre + spyre-inference on a Spyre
       host.
 - [ ] Recorded commit/version triple; a clean rebuild reproduces a working stack.
 - [ ] A trivial spyre op and a `vllm serve` boot both succeed on the built stack.
@@ -382,7 +382,7 @@ stack is stable at the prompt lengths we care about.
   runtime configs tried.
 - Record **baseline TTFT vs. prompt length** (recomputation) as the reference for later offload
   comparisons.
-- **Pin a spyre-inference version/commit** (together with the M1-P1 flex/torch-spyre pins) as
+- **Pin a spyre-inference version/commit** (together with the M1-P1 hardware-runtime/torch-spyre pins) as
   the development baseline for the KV-offload work.
 
 **Tests / verification**
@@ -467,7 +467,7 @@ primitive both milestones build on.
   H2D/D2H launch.
 - Copy length is the device allocation's physical size (`total_size()` — the padded/tiled
   byte count, **not** `numel × itemsize`).
-- Single-chunk is the common case; the multi-chunk (1p5) path is **M2-F3**, not here.
+- Single-chunk is the common case; the multi-chunk path is **M2-F3**, not here.
 
 **Unit tests**
 
@@ -832,7 +832,7 @@ performance benchmark.
 **Body:**
 
 **Summary:** A shared directory mapping block-hash → slot-id with per-slot lifecycle state and
-a chunk descriptor for the multi-chunk (1p5) path. This is the bookkeeping that makes
+a chunk descriptor for the multi-chunk path. This is the bookkeeping that makes
 cross-instance reuse possible.
 
 **What**
@@ -918,14 +918,14 @@ miss — never a torn read:
 
 ---
 
-## M2-F3 — `copyRaw` multi-chunk (1p5) + cross-process slot round-trip
+## M2-F3 — `copyRaw` multi-chunk + cross-process slot round-trip
 
-**Title:** `[M2-F3] Hardware runtime: copyRaw multi-chunk (1p5) + cross-process slot round-trip`
+**Title:** `[M2-F3] Hardware runtime: copyRaw multi-chunk + cross-process slot round-trip`
 **Labels:** `kvc-offloading` · **Milestone:** M2 (end Sep 2026) · **Epic:** #\<M2>
 
 **Body:**
 
-**Summary:** Extend the raw copy for the multi-chunk (1p5) case. The `slot_id` seam and copy
+**Summary:** Extend the raw copy for the multi-chunk case. The `slot_id` seam and copy
 signature are unchanged from M1; single-chunk is the degenerate `num_chunks == 1` case.
 
 **What**

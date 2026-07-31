@@ -6,7 +6,7 @@
 
 ### Prerequisites (block all of M1)
 
-- [ ] __M1P1__ — Env: custom-built flex + torch-spyre + spyre-inference (reproducible, pinned)
+- [ ] __M1P1__ — Env: custom-built hardware runtime + torch-spyre + spyre-inference (reproducible, pinned)
 - [ ] __M1P2__ — spyre-inference recomputation baseline on latest code + pin a version
 - [ ] __M1P3__ — Define the host CPU buffer/tensor model for raw copy (before M1-F1)
 

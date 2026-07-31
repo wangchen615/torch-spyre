@@ -1,10 +1,10 @@
-**Summary:** Make the host tier a single **shared host memory pool** shared by every co-located Spyre instance, so a KV block offloaded by one instance is reloaded by another with **one raw DMA and no serialization** — at memory speed, no disk. Reuses M1's private pool object and canonical copy path **unchanged**; adds the cross-instance layer: a `SharedHostMetadata` block-hash→slot directory, a per-slot concurrency/generation protocol with a publish-on-DMA-completion gate (a stale or mid-write slot degrades to a **cache miss, never torn bytes**), the multi-chunk (1p5) raw-copy path, and the `SpyreSharedOffloadingSpec` connector wiring. Gated on the directory, the concurrency protocol, and the multi-chunk copy landing. M2 targets the correctness **baseline**; a dedicated DMA stream (overlap optimization) is **deferred to the backlog** (M2-T2), not part of M2.
+**Summary:** Make the host tier a single **shared host memory pool** shared by every co-located Spyre instance, so a KV block offloaded by one instance is reloaded by another with **one raw DMA and no serialization** — at memory speed, no disk. Reuses M1's private pool object and canonical copy path **unchanged**; adds the cross-instance layer: a `SharedHostMetadata` block-hash→slot directory, a per-slot concurrency/generation protocol with a publish-on-DMA-completion gate (a stale or mid-write slot degrades to a **cache miss, never torn bytes**), the multi-chunk raw-copy path, and the `SpyreSharedOffloadingSpec` connector wiring. Gated on the directory, the concurrency protocol, and the multi-chunk copy landing. M2 targets the correctness **baseline**; a dedicated DMA stream (overlap optimization) is **deferred to the backlog** (M2-T2), not part of M2.
 
 ### Hardware runtime
 
 - [ ] __M2F1__ — `SharedHostMetadata` — block-hash → slot directory
 - [ ] __M2F2__ — Concurrency protocol (locks + generation + publish gate) — full race coverage
-- [ ] __M2F3__ — `copyRaw` multi-chunk (1p5) + cross-process slot round-trip
+- [ ] __M2F3__ — `copyRaw` multi-chunk + cross-process slot round-trip
 
 ### torch-spyre
 

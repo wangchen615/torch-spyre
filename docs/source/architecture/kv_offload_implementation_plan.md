@@ -91,7 +91,7 @@ Assessed against the latest `main` of each layer on 2026-07-28.
   *latest* spyre-inference with a **pinned** version (M1-P2), and a documented **host CPU
   buffer model** for the raw copy (M1-P3, before M1-F1).
 - **M2 is the cross-instance layer.** M2 adds the `SharedHostMetadata` directory, the
-  per-slot concurrency/generation protocol and publish gate, the multi-chunk (1p5)
+  per-slot concurrency/generation protocol and publish gate, the multi-chunk
   `copyRaw` path, and the connector wiring that lets co-located instances share one pool.
   M2 targets the correctness **baseline**; a dedicated DMA stream (overlap optimization) is
   **deferred to the backlog** (M2-T2), not part of M2.
@@ -202,7 +202,7 @@ pool-binding, and copy-binding, plus the connector. It does **not** need the dir
 the cross-process concurrency protocol, or a dedicated DMA stream (those are M2 / the
 backlog). Three **prerequisites** block all of M1.
 
-#### M1-P1 — prereq: reproducible custom-built flex + torch-spyre + spyre-inference env
+#### M1-P1 — prereq: reproducible custom-built hardware runtime + torch-spyre + spyre-inference env
 
 - **Detailed body:** [`bodies/M1-P1.md`](../../../scripts/kv_offload_issues/bodies/M1-P1.md)
 - **Layer:** all (env)
@@ -273,7 +273,7 @@ backlog). Three **prerequisites** block all of M1.
   existing straight-byte-copy path (the DMA params where the conversion descriptor is
   null) and the existing H2D/D2H launch. The copy length is the device allocation's
   physical size (`total_size()` — the padded/tiled byte count, **not**
-  `numel × itemsize`). Single-chunk is the common case; the multi-chunk (1p5) path is
+  `numel × itemsize`). Single-chunk is the common case; the multi-chunk path is
   M2-F3. This is the named, testable primitive both milestones build on.
 - **Closes with / acceptance:** a device page filled with a known pattern **loads to a
   host region and restores byte-for-byte** (device→host→device round-trip, byte-exact),
@@ -480,7 +480,7 @@ M2.
 - **Blocks:** M2-F2, M2-T1
 - **Description:** A shared directory mapping block-hash → slot-id with per-slot
   lifecycle state (empty → reserved → valid → empty) and a chunk descriptor
-  (`{num_chunks, [{domain_id, size}]}`) for the multi-chunk (1p5) path.
+  (`{num_chunks, [{domain_id, size}]}`) for the multi-chunk path.
   `lookup(hash) -> slot | miss`, `claim(hash) -> slot`, `publish(hash, slot)`,
   `evict(hash)`. The metadata segment is mapped at a common virtual base so its internals
   can be pointer-based; the data pool (M1-F2) stays index-addressed. This is the
@@ -532,14 +532,14 @@ M2.
   A stress test running the matrix for a sustained duration under N processes reports
   **zero torn reads** and **zero double-allocations**.
 
-#### M2-F3 — hardware runtime: `copyRaw` multi-chunk (1p5) + cross-process slot round-trip
+#### M2-F3 — hardware runtime: `copyRaw` multi-chunk + cross-process slot round-trip
 
 - **Detailed body:** [`bodies/M2-F3.md`](../../../scripts/kv_offload_issues/bodies/M2-F3.md)
 - **Layer:** hardware runtime
 - **Milestone:** M2 (end Sep 2026)
 - **Label:** `kvc-offloading`
 - **Blocked by:** M1-F1, M1-F2, M2-F2
-- **Description:** Extend the raw copy for the multi-chunk (1p5) case: on offload, walk
+- **Description:** Extend the raw copy for the multi-chunk case: on offload, walk
   the source `CompositeAddress` and pack the chunks contiguously into the slot, recording
   the `{num_chunks, [{domain_id, size}]}` descriptor into the directory; on reload, read
   the descriptor, place the chunks on their recorded domains to build a **fresh**
