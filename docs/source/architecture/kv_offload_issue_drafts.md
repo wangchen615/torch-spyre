@@ -887,6 +887,27 @@ degrade to a **cache miss, never torn bytes**.
 - Process-shared directory lock; per-slot rwlock-style pin; per-slot generation counter;
   publish-on-completion gate.
 
+**Atomicity / critical-section contract (RFC §4.4)**
+
+The upper layer (the Python connector) drives a KV transfer as a **sequence** of directory
+ops — e.g. `claim` → device↔host DMA → `publish`, or `lookup` → pin → reload. This issue must
+state, per RFC §4.4, exactly which steps a single acquire of the directory lock covers and
+which the **caller composes** across separate calls:
+
+- **Atomic within one lock hold:** each individual op (`lookup`, `claim`, `publish`, `evict`)
+  is internally atomic against the shared directory — a concurrent process never observes a
+  half-updated directory or slot state.
+- **Caller-composed (not one lock):** the `claim` → DMA → `publish` span is **not** held under
+  a single directory lock for the DMA's duration (the DMA is long and must not block other
+  instances). Correctness across that span comes from the **pin + generation + publish gate**,
+  not from holding the lock — a slot mid-write is a **miss until `publish`**, and generation
+  reuse between a caller's `lookup` and its DMA is caught by the generation check.
+- The lock is held only for the short directory mutations, **never across a DMA**; blocking to
+  acquire it is bounded and does not deadlock with a peer holding a pin.
+
+This contract is what M2-T1 exposes to Python and what defines the GIL-release policy at the
+binding (see M2-T1).
+
 **Unit / stress tests — full data-race matrix (full coverage on the racing cases)**
 
 Each case runs under concurrent multi-process load and asserts either correct data or a clean
@@ -908,11 +929,22 @@ miss — never a torn read:
   → reader completes on the old generation or misses; writer waits or picks another slot.
 - **Sustained stress:** run the matrix for a sustained duration under N processes → **zero
   torn reads, zero double-allocations**.
+- **Multi-op sequence under the GIL:** the matrix is also driven from Python threads through
+  the M2-T1 bindings, so the `claim`→DMA→`publish` / `lookup`→pin→reload sequences race across
+  *both* processes and Python threads. A binding that blocks on the directory lock must not
+  stall unrelated Python threads (validates the GIL-release policy defined in M2-T1); the
+  caller-composed span still yields a clean miss, never torn bytes.
 
 **Acceptance**
 
 - [ ] All matrix cases pass.
 - [ ] Sustained N-process stress reports zero torn reads and zero double-allocations.
+- [ ] The atomicity / critical-section contract (which steps one lock hold covers vs. what the
+      caller composes across calls) is documented per RFC §4.4, and the lock is verified
+      **never held across a DMA**.
+- [ ] Driven from concurrent Python threads through the M2-T1 bindings, a binding blocked on
+      the directory lock does not stall unrelated Python threads, and the multi-op sequence
+      still degrades to a miss, never torn bytes.
 
 **Blocked by:** M2-F1
 
@@ -990,6 +1022,23 @@ The exact names/arities are pinned to the hardware-runtime `SharedHostMetadata` 
 implementation time; the list above is the binding contract this issue must satisfy (adjust
 only to match the merged header, and note any deviation in the PR).
 
+**GIL / multi-op sequencing policy.** The upper layer calls these ops as a *sequence*
+(`claim` → DMA → `publish`, or `lookup` → pin → reload) from Python, and each op may block on
+the hardware runtime's process-shared directory lock (RFC §4.4). This binding issue must state
+and enforce, at the pybind seam:
+
+- **Release the GIL for any call that can block** on the directory lock or a DMA
+  (`py::gil_scoped_release` around the C++ call), so a Spyre instance stalled on a peer's lock
+  does **not** freeze every other Python thread in the process (vLLM's scheduler, other
+  connectors).
+- **The critical section is caller-composed, not a single atomic binding.** There is no
+  combined `claim_dma_publish` binding that holds the lock across the DMA. The connector issues
+  the ops in sequence; correctness across the span comes from M2-F2's pin + generation +
+  publish gate (a mid-write slot is a miss until `publish`), **not** from holding the GIL or the
+  directory lock across the DMA.
+- Each individual binding maps to exactly one internally-atomic directory op (per the M2-F2
+  contract); the bindings add no locking of their own.
+
 **Unit tests**
 
 - Each exposed call is reachable from Python with the signature above: `create_or_attach`,
@@ -1014,6 +1063,11 @@ only to match the merged header, and note any deviation in the PR).
 - [ ] Two-process attach sees the same slots and mappings from Python.
 - [ ] **Torn-read passthrough:** a mid-write / reused slot yields a **miss from Python**, never
       torn bytes (bindings do not weaken the M2-F2 protocol).
+- [ ] **GIL released** for any binding that can block on the directory lock or a DMA: a call
+      blocked on a peer's lock does not stall unrelated Python threads (test drives two Python
+      threads, one blocked, and asserts the other makes progress).
+- [ ] The `claim`→DMA→`publish` critical section is **caller-composed** (no single atomic
+      binding holds the lock across a DMA); documented at this seam.
 - [ ] No pointer/address leaks to Python.
 
 **Blocked by:** M2-F1, M2-F2 — the concurrency-safe ops must exist before their Python
