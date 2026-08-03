@@ -94,8 +94,10 @@ else
 fi
 
 find_existing () {  # $1 = exact title -> echoes number or nothing
-  gh issue list --repo "$REPO" --state all --limit 200 --json number,title \
-    --jq ".[] | select(.title == \$t) | .number" --arg t "$1" 2>/dev/null | head -1
+  # NOTE: `gh issue list --jq` does NOT accept jq's `--arg`; pass the title via
+  # the environment and read it with jq's $ENV instead.
+  FIND_TITLE="$1" gh issue list --repo "$REPO" --state all --limit 200 --json number,title \
+    --jq '.[] | select(.title == $ENV.FIND_TITLE) | .number' 2>/dev/null | head -1
 }
 
 echo "==> Step 2: create issues (labels + milestone), body has placeholders for now"

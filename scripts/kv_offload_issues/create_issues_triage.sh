@@ -62,8 +62,9 @@ EPICS=(EDESIGN M1 M2)
 declare -A NUM
 
 find_existing () {
-  gh issue list --repo "$REPO" --state all --limit 300 --json number,title \
-    --jq ".[] | select(.title == \$t) | .number" --arg t "$1" 2>/dev/null | head -1
+  # `gh issue list --jq` does NOT accept jq's `--arg`; pass the title via env + $ENV.
+  FIND_TITLE="$1" gh issue list --repo "$REPO" --state all --limit 300 --json number,title \
+    --jq '.[] | select(.title == $ENV.FIND_TITLE) | .number' 2>/dev/null | head -1
 }
 is_epic () { printf '%s\n' "${EPICS[@]}" | grep -qx "$1"; }
 
