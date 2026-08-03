@@ -3,13 +3,14 @@
 ### What
 
 - Land the RFC document in the hardware-runtime repo (RFC + any figures).
-- Public API surface defined: `copyRaw(host_addr, CompositeAddress*, to_device)`, `SharedHostPool::create_or_attach(stream, name, num_slots, slot_bytes)`, `SharedHostMetadata::create_or_attach(...)`, the concurrency protocol, and the multi-chunk pack/rebuild contract.
+- Public API surface defined: `copyRaw(host_addr, host_capacity, CompositeAddress*, to_device)`, `SharedHostPool::create_or_attach(stream, name, num_slots, slot_bytes)`, `SharedHostMetadata::create_or_attach(...)`, the concurrency protocol, and the multi-chunk pack/rebuild contract.
 - Ownership split stated: the hardware runtime owns the mechanism; torch-spyre owns only the tensor→address step and thin bindings; spyre-inference owns cache policy.
 
 ### Acceptance
 
 - [ ] RFC merged.
 - [ ] API signatures match what E-D2 (torch-spyre) and E-D3 (spyre-inference) consume — one canonical `copy_tensor_raw(dev_tensor, pool, slot_id, to_device)` seam, integer `slot_id`, no caller-owned host-buffer path.
+- [ ] Raw copy is **bounds-checked against the slot** (per @thalexan review): `copyRaw` takes an explicit `host_capacity`, callers pass `pool.slot_bytes()`, and the copy requires `total_size() <= host_capacity` — a page larger than the slot fails loudly rather than overrunning the neighbor. The pool must be sized `slot_bytes >=` the model's max KV-page `total_size()` (Appendix B guard 4).
 
 **Blocked by:** none
 
