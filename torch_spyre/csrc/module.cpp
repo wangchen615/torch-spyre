@@ -28,6 +28,7 @@
 #include <cstdlib>     // std::getenv
 #include <filesystem>  // NOLINT(build/c++17)
 #include <flex/flex.hpp>
+#include <flex/memory_interface/shared_host_pool.hpp>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -256,7 +257,21 @@ PYBIND11_MODULE(_C, m) {
 
   py::class_<spyre::SpyreTensorLayout> dci_cls(m, "SpyreTensorLayout");
 
-  dci_cls.def_readonly("device_size", &spyre::SpyreTensorLayout::device_size)
+  py::class_<flex::SharedHostPool>(m, "SharedHostPool")
+      .def_static(
+          "create_or_attach",
+          [](const std::string& name, size_t num_slots, size_t slot_bytes) {
+            return flex::SharedHostPool::createOrAttach(
+                spyre::GlobalRuntime::get().get(), name, num_slots, slot_bytes)
+          },
+          py::arg("name"), py::arg("num_slots"), py::arg("slot_bytes"))
+      .def_static("unlink_by_name", &flex::SharedHostPool::unlinkByName,
+                  py::arg("name"))
+      .def("slot_count", &flex::SharedHostPool::slot_count)
+      .def("slot_bytes", &flex::SharedHostPool::slot_bytes)
+
+          dci_cls
+      .def_readonly("device_size", &spyre::SpyreTensorLayout::device_size)
       .def_readonly("stride_map", &spyre::SpyreTensorLayout::stride_map)
       .def_readonly("device_dtype", &spyre::SpyreTensorLayout::device_dtype)
       .def_readonly("element_arrangement",
