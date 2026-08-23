@@ -24,10 +24,48 @@ class TestSharedHostPool(TestCase):
     """
 
     def test_create_or_attach(self):
+        # Create a shared pool
         shared_pool = torch_spyre._C.SharedHostPool.create_or_attach("Testing", 5, 5)
 
+        # Check if slot count is as expected
         self.assertEqual(shared_pool.slot_count(), 5)
+
+        # Check if greater than or equal because the actual slot bytes may be
+        # larger due to alignment of size/stride of the pool
         self.assertGreaterEqual(shared_pool.slot_bytes(), 5)
+
+    def test_attach_existing_pool(self):
+        # Create a shared pool
+        torch_spyre._C.SharedHostPool.create_or_attach("Testing", 5, 5)
+
+        # Attach to the existing shared pool
+        shared_pool_compare = torch_spyre._C.SharedHostPool.create_or_attach(
+            "Testing", 10, 10
+        )
+
+        self.assertEqual(shared_pool_compare.slot_count(), 5)
+        self.assertGreaterEqual(shared_pool_compare.slot_bytes(), 5)
+
+    def no_host_pointer(self):
+        # Create a shared pool
+        shared_pool = torch_spyre._C.SharedHostPool.create_or_attach("Testing", 5, 5)
+
+        # Check if host pointer is None
+        self.assertIsNone(shared_pool.host_pointer())
+
+    def test_pool_real_model(self):
+        # KV geometry from ibm-ai-platform/micro-g3.3-8b-instruct-1b (HF config)
+        NUM_LAYERS, KV_HEADS, HEAD_DIM, BLOCK_SIZE = 4, 8, 128, 128
+
+        # Multiply by 2 for key and value, and by 2 for float16
+        slot_bytes = NUM_LAYERS * KV_HEADS * HEAD_DIM * 2 * 2 * BLOCK_SIZE
+
+        # Choosing common prompt length of 8192 for testing
+        slot_count = 8192 / BLOCK_SIZE
+
+        torch_spyre._C.SharedHostPool.create_or_attach(
+            "Testing", int(slot_count), int(slot_bytes)
+        )
 
 
 if __name__ == "__main__":
