@@ -603,10 +603,18 @@ at::Tensor& spyre_set_storage(at::Tensor& result, at::Storage storage,
 void copy_tensor_raw(const at::Tensor& dev_tensor,
                      const flex::SharedHostPool& pool, size_t slot_id,
                      bool to_device, bool non_blocking = false) {
-  host_address = pool.slot_ptr(slot_id)
+  c10::Device device = dev_tensor.device();
+  SpyreStream stream = getCurrentStream(device);
 
-                     composite_address =
-      spyre::get_composite_address(dev_tensor);
+  void* host_address = pool.slot_ptr(slot_id);
+
+  composite_address = spyre::get_composite_address(dev_tensor);
+
+  flex::copyRaw(host_address, composite_address, to_device);
+
+  if (!non_blocking) {
+    stream.synchronize();
+  }
 }
 
 /**
