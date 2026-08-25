@@ -56,6 +56,15 @@ class TestSpyre(TestCase):
 
         self.assertEqual(tensor_on_spyre, tensor_reloaded)
 
+    def test_normal_copy_tensor_unaffected(self):
+        """
+        Ensure the normal copy_tensor (.to()) function is unaffected.
+        """
+        tensor = torch.randn(10, dtype=torch.float16)
+        tensor_on_spyre = tensor.to("spyre")
+        tensor_back = tensor_on_spyre.to("cpu")
+        self.assertEqual(tensor, tensor_back)
+
 
 if __name__ == "__main__":
     run_tests()
