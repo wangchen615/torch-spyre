@@ -33,7 +33,7 @@ class TestSpyre(TestCase):
         super().setUp()
         torch.manual_seed(0xAFFE)
 
-    def test_kv_offload_reload(self):
+    def test_kv_offload_reload_zeroed(self):
         tensor_on_spyre = torch.randn(10, device="spyre", dtype=torch.float16)
 
         # Composite address handle for the tensor to determine the size of the slot needed in the shared host pool
@@ -51,7 +51,30 @@ class TestSpyre(TestCase):
         copy_tensor_raw(tensor_on_spyre, pool, slot_id, to_device=False)
 
         # H2D: Move tensor back from host memory pool to spyre
-        tensor_reloaded = torch.empty_like(tensor_on_spyre, device="spyre")
+        tensor_reloaded = tensor_on_spyre.zero_()
+        copy_tensor_raw(tensor_reloaded, pool, slot_id, to_device=True)
+
+        self.assertEqual(tensor_on_spyre, tensor_reloaded)
+
+    def test_kv_offload_reload_diff_tensor(self):
+        tensor_on_spyre = torch.randn(10, device="spyre", dtype=torch.float16)
+
+        # Composite address handle for the tensor to determine the size of the slot needed in the shared host pool
+        slot_bytes = get_composite_address_handle(tensor_on_spyre).total_size()
+
+        # Create the shared pool with a single slot of the required size
+        pool = SharedHostPool.create_or_attach(
+            "kv_offload_pool", num_slots=1, slot_bytes=slot_bytes
+        )
+
+        # Use the first slot in the pool
+        slot_id = 0
+
+        # D2H: Move tensor from spyre to host memory pool
+        copy_tensor_raw(tensor_on_spyre, pool, slot_id, to_device=False)
+
+        # H2D: Move tensor back from host memory pool to spyre
+        tensor_reloaded = tensor_on_spyre.empty_like(tensor_on_spyre)
         copy_tensor_raw(tensor_reloaded, pool, slot_id, to_device=True)
 
         self.assertEqual(tensor_on_spyre, tensor_reloaded)
