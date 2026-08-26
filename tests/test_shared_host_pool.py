@@ -14,6 +14,7 @@
 
 
 import torch
+import os
 
 from torch.testing._internal.common_utils import (
     TestCase,
@@ -130,8 +131,27 @@ class TestSharedHostPool(TestCase):
 
         SharedHostPool.create_or_attach("Testing", int(slot_count), int(slot_bytes))
 
-    # TODO: Implement a test for different processes
-    # def test_different_processes(self):
+    def test_different_processes(self):
+        """
+        Test two different processes creating and attaching to the same shared pool.
+        """
+        slot_count = 5
+        slot_bytes = 5
+        _ = SharedHostPool.create_or_attach("Testing", slot_count, slot_bytes)
+
+        pid = os.fork()
+        if pid == 0:
+            shared_pool_child = SharedHostPool.create_or_attach(
+                "Testing", slot_count, slot_bytes
+            )
+            match = (
+                shared_pool_child.slot_count() == slot_count
+                and shared_pool_child.slot_bytes() >= slot_bytes
+            )
+            os._exit(0 if match else 1)
+
+        _, status = os.waitpid(pid, 0)
+        self.assertEqual(status, 0)
 
 
 if __name__ == "__main__":
