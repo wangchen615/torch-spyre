@@ -14,6 +14,7 @@
 
 
 import torch
+import os
 
 from torch.testing._internal.common_utils import (
     TestCase,
@@ -104,9 +105,39 @@ class TestSpyre(TestCase):
         kv_page_tensor = torch.randn(kv_page_shape, device="spyre", dtype=torch.float16)
         self._kv_offload_reload(kv_page_tensor, torch.zeros_like(kv_page_tensor))
 
-    # Implement a test for different processes
-    # def test_diff_processes(self):
-    #     pass
+    def test_diff_processes(self):
+        """
+        Test if the bytes survived a round trip from spyre to host memory pool and back to spyre with different processes.
+        """
+        kv_page_tensor = torch.randn(10, device="spyre", dtype=torch.float16)
+
+        # Composite address handle for the tensor to determine the size of the slot needed in the shared host pool
+        slot_bytes = get_composite_address_handle(kv_page_tensor).total_size()
+
+        # Create the shared pool with a single slot of the required size
+        pool = SharedHostPool.create_or_attach(
+            self.id(), num_slots=1, slot_bytes=slot_bytes
+        )
+
+        # Use the first slot in the pool
+        slot_id = 0
+
+        pid = os.fork()
+        if pid == 0:
+            # D2H: Move tensor from spyre to host memory pool
+            copy_tensor_raw(kv_page_tensor, pool, slot_id, to_device=False)
+            os._exit(0)
+
+        _, status = os.waitpid(pid, 0)
+        self.assertEqual(status, 0)
+
+        kv_page_tensor_reload = torch.empty_like(kv_page_tensor)
+
+        # H2D: Move tensor back from host memory pool to spyre
+        copy_tensor_raw(kv_page_tensor_reload, pool, slot_id, to_device=True)
+
+        # Verify that the tensor matches the original
+        self.assertTrue(torch.equal(kv_page_tensor, kv_page_tensor_reload))
 
 
 if __name__ == "__main__":
