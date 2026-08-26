@@ -13,9 +13,19 @@
 # limitations under the License.
 
 
-from torch.testing._internal.common_utils import run_tests, TestCase
+import torch
 
-import torch_spyre
+from torch.testing._internal.common_utils import (
+    TestCase,
+    run_tests,
+)
+from transformers import AutoConfig
+
+# TEMPORARY BLOCK FOR RUFF:
+from torch_spyre._C import (  # type: ignore[attr-defined]
+    SharedHostPool,
+    get_composite_address_handle,
+)
 
 
 class TestSharedHostPool(TestCase):
@@ -23,9 +33,18 @@ class TestSharedHostPool(TestCase):
     Tests for the SharedHostPool functionality in the torch_spyre module.
     """
 
+    def setUp(self):
+        super().setUp()
+
+        # Load the model configuration for ibm-ai-platform/micro-g3.3-8b-instruct-1b
+        self.cfg = AutoConfig.from_pretrained(
+            "ibm-ai-platform/micro-g3.3-8b-instruct-1b"
+        )
+        self.head_dim = self.cfg.hidden_size // self.cfg.num_attention_heads
+
     def test_create_or_attach(self):
         # Create a shared pool
-        shared_pool = torch_spyre._C.SharedHostPool.create_or_attach("Testing", 5, 5)
+        shared_pool = SharedHostPool.create_or_attach("Testing", 5, 5)
 
         # Check if slot count is as expected
         self.assertEqual(shared_pool.slot_count(), 5)
@@ -35,37 +54,84 @@ class TestSharedHostPool(TestCase):
         self.assertGreaterEqual(shared_pool.slot_bytes(), 5)
 
     def test_attach_existing_pool(self):
-        # Create a shared pool
-        torch_spyre._C.SharedHostPool.create_or_attach("Testing", 5, 5)
+        # Create a shared pool and assign to _ to keep it alive
+        _ = SharedHostPool.create_or_attach("Testing", 5, 5)
 
         # Attach to the existing shared pool
-        shared_pool_compare = torch_spyre._C.SharedHostPool.create_or_attach(
-            "Testing", 10, 10
-        )
+        shared_pool_compare = SharedHostPool.create_or_attach("Testing", 5, 5)
 
         self.assertEqual(shared_pool_compare.slot_count(), 5)
         self.assertGreaterEqual(shared_pool_compare.slot_bytes(), 5)
 
-    def no_host_pointer(self):
+    def test_geometry_mismatch(self):
+        # Create a shared pool and assign to _ to keep it alive
+        _ = SharedHostPool.create_or_attach("Testing", 5, 5)
+
+        # Attempt to attach to the existing shared pool with different geometry
+        with self.assertRaises(RuntimeError):
+            SharedHostPool.create_or_attach("Testing", 10, 10)
+
+    def test_no_host_pointer(self):
         # Create a shared pool
-        shared_pool = torch_spyre._C.SharedHostPool.create_or_attach("Testing", 5, 5)
+        shared_pool = SharedHostPool.create_or_attach("Testing", 5, 5)
 
-        # Check if host pointer is None
-        self.assertIsNone(shared_pool.host_pointer())
+        # Confirm that the shared pool does not have a host pointer attribute
+        self.assertFalse(hasattr(shared_pool, "slot_ptr"))
 
-    def test_pool_real_model(self):
-        # KV geometry from ibm-ai-platform/micro-g3.3-8b-instruct-1b (HF config)
-        NUM_LAYERS, KV_HEADS, HEAD_DIM, BLOCK_SIZE = 4, 8, 128, 128
-
-        # Multiply by 2 for key and value, and by 2 for float16
-        slot_bytes = NUM_LAYERS * KV_HEADS * HEAD_DIM * 2 * 2 * BLOCK_SIZE
-
-        # Choosing common prompt length of 8192 for testing
-        slot_count = 8192 / BLOCK_SIZE
-
-        torch_spyre._C.SharedHostPool.create_or_attach(
-            "Testing", int(slot_count), int(slot_bytes)
+    def test_pool_real_model_small_slot(self):
+        """
+        Test SharedHostPool creation with real model ibm-ai-platform/micro-g3.3-8b-instruct-1b
+        with a small slot for K/V for 16 tokens 64 (KiB).
+        """
+        # Shape: num_hidden_layers x 2 (K & V) x 16 (block size) x num_key_value_heads x head_dim
+        block_size = 16
+        kv_page_shape = (
+            self.cfg.num_hidden_layers,
+            2,
+            block_size,
+            self.cfg.num_key_value_heads,
+            self.head_dim,
         )
+
+        # Create a tensor for KV Cache page with the shape needed for the model
+        kv_page_tensor = torch.randn(kv_page_shape, device="spyre", dtype=torch.float16)
+
+        # Padded/tiled byte count of the page is the slot size
+        slot_bytes = get_composite_address_handle(kv_page_tensor).total_size()
+
+        # Choosing common prompt length of 8192 (tokens) for testing
+        slot_count = 8192 // block_size
+
+        SharedHostPool.create_or_attach("Testing", int(slot_count), int(slot_bytes))
+
+    def test_pool_real_model_large_slot(self):
+        """
+        Test SharedHostPool creation with real model ibm-ai-platform/micro-g3.3-8b-instruct-1b
+        with a large slot for K/V for 1024 tokens 4 (MiB) to test a multi-MB page.
+        """
+        # Shape: num_hidden_layers x 2 (K & V) x 1024 (block size) x num_key_value_heads x head_dim
+        block_size = 1024
+        kv_page_shape = (
+            self.cfg.num_hidden_layers,
+            2,
+            block_size,
+            self.cfg.num_key_value_heads,
+            self.head_dim,
+        )
+
+        # Create a tensor for KV Cache page with the shape needed for the model
+        kv_page_tensor = torch.randn(kv_page_shape, device="spyre", dtype=torch.float16)
+
+        # Padded/tiled byte count of the page is the slot size
+        slot_bytes = get_composite_address_handle(kv_page_tensor).total_size()
+
+        # Choosing common prompt length of 8192 (tokens) for testing
+        slot_count = 8192 // block_size
+
+        SharedHostPool.create_or_attach("Testing", int(slot_count), int(slot_bytes))
+
+    # TODO: Implement a test for different processes
+    # def test_different_processes(self):
 
 
 if __name__ == "__main__":
