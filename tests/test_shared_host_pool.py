@@ -134,20 +134,16 @@ class TestSharedHostPool(TestCase):
         """
         Test two different processes creating and attaching to the same shared pool.
         """
-        slot_count = 5
-        slot_bytes = 5
-        _ = SharedHostPool.create_or_attach("Testing", slot_count, slot_bytes)
+        _ = SharedHostPool.create_or_attach("Testing", 5, 5)
 
         pid = os.fork()
         if pid == 0:
-            shared_pool_child = SharedHostPool.create_or_attach(
-                "Testing", slot_count, slot_bytes
-            )
-            match = (
-                shared_pool_child.slot_count() == slot_count
-                and shared_pool_child.slot_bytes() >= slot_bytes
-            )
-            os._exit(0 if match else 1)
+            # Child process should throw a RuntimeError when trying to create a pool with different geometry
+            try:
+                SharedHostPool.create_or_attach("Testing", 10, 5)
+                os._exit(1)
+            except RuntimeError:
+                os._exit(0)
 
         _, status = os.waitpid(pid, 0)
         self.assertEqual(status, 0)
