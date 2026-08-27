@@ -22,7 +22,6 @@ from torch.testing._internal.common_utils import (
 )
 from transformers import AutoConfig
 
-# TEMPORARY BLOCK FOR RUFF:
 from torch_spyre._C import (  # type: ignore[attr-defined]
     SharedHostPool,
     get_composite_address_handle,
