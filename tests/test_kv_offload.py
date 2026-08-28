@@ -22,7 +22,6 @@ from torch.testing._internal.common_utils import (
 )
 from transformers import AutoConfig
 
-# TEMPORARY BLOCK FOR RUFF:
 from torch_spyre._C import (  # type: ignore[attr-defined]
     SharedHostPool,
     copy_tensor_raw,
@@ -33,7 +32,6 @@ from torch_spyre._C import (  # type: ignore[attr-defined]
 class TestSpyre(TestCase):
     def setUp(self):
         super().setUp()
-        torch.manual_seed(0xAFFE)
 
         # Load the model configuration for ibm-ai-platform/micro-g3.3-8b-instruct-1b
         self.cfg = AutoConfig.from_pretrained(
@@ -56,7 +54,7 @@ class TestSpyre(TestCase):
         # Use the first slot in the pool
         slot_id = 0
 
-        # D2H: Move tensor from spyre to host memory pool
+        # D2H: Move tensor from spyre to host memory pool or fill kv_page_data into the shared host pool
         copy_tensor_raw(kv_page_tensor, pool, slot_id, to_device=False)
 
         # H2D: Move tensor back from host memory pool to spyre
