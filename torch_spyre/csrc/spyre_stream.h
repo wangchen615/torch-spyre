@@ -65,6 +65,15 @@ class SpyreStream {
   void fillAsync(const flex::CompositeAddress* dst, double value,
                  DataFormats dtype, bool use_dmai) const;
 
+  // Byte-exact host<->device DMA used by the KV-offload path. Routes straight
+  // through flex::RuntimeStream::copyRaw with no layout conversion: the host
+  // side is a shared-pool slot and the bytes are moved verbatim.
+  // `host_capacity` is the addressable length at `host_address` (the pool's
+  // SlotBytes()); copyRaw rejects a capacity smaller than the device region.
+  void copyRaw(void* host_address, size_t host_capacity,
+               const flex::CompositeAddress* device_address,
+               bool to_device) const;
+
   // Conversions
   c10::Stream unwrap() const;
 

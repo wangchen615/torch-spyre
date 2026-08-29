@@ -611,7 +611,7 @@ void copy_tensor_raw(const at::Tensor& dev_tensor,
   const flex::CompositeAddress* composite_address =
       spyre::get_composite_address(dev_tensor);
 
-  stream.copyRaw(host_address, pool.slot_bytes(), composite_address, to_device);
+  stream.copyRaw(host_address, pool.SlotBytes(), composite_address, to_device);
 
   if (!non_blocking) {
     stream.synchronize();
