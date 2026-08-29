@@ -606,6 +606,15 @@ void copy_tensor_raw(const at::Tensor& dev_tensor,
   c10::Device device = dev_tensor.device();
   SpyreStream stream = getCurrentStream(device);
 
+  // FIXME(kvc): BLOCKED on a flex-side API decision.
+  // flex::SharedHostPool::SlotPtr is private (friend class RuntimeStream), so
+  // the raw host address deliberately cannot leave the hardware runtime -- see
+  // the comment on SlotPtr in shared_host_pool.hpp. This line therefore does
+  // not compile against flex kvc-offload-dev.
+  // The sanctioned fix is a pool-aware overload in flex, e.g.
+  //   RuntimeStream::copyRaw(const SharedHostPool&, size_t slot, ...)
+  // which the existing friend declaration already anticipates. flex granted
+  // the friendship but has not yet added the method that uses it.
   void* host_address = pool.slot_ptr(slot_id);
 
   const flex::CompositeAddress* composite_address =
