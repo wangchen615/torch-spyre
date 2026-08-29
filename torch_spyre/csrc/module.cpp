@@ -262,7 +262,7 @@ PYBIND11_MODULE(_C, m) {
           "create_or_attach",
           [](const std::string& name, size_t num_slots, size_t slot_bytes) {
             return flex::SharedHostPool::CreateOrAttach(
-                spyre::GlobalRuntime::get().get(), name, num_slots, slot_bytes);
+                spyre::GlobalRuntime::get(), name, num_slots, slot_bytes);
           },
           py::arg("name"), py::arg("num_slots"), py::arg("slot_bytes"))
       .def_static("unlink_by_name", &flex::SharedHostPool::UnlinkByName,
