@@ -439,16 +439,7 @@ PYBIND11_MODULE(_C, m) {
                              &spyre::CompositeAddressHandle::num_chunks,
                              "Number of device chunks the allocation spans")
       .def("chunks", &spyre::CompositeAddressHandle::chunks,
-           "Per-chunk geometry, in order")
-      // Call-style aliases. #3587 exposes total_size/num_chunks as properties,
-      // but the #3915 and #3964 tests were written against a call-style
-      // handle (handle.total_size()). Binding both keeps each PR's tests
-      // working unmodified; pick one and drop the other once the KV-offload
-      // Python surface is settled.
-      .def("get_total_size", &spyre::CompositeAddressHandle::total_size,
-           "Call-style alias for the total_size property")
-      .def("get_num_chunks", &spyre::CompositeAddressHandle::num_chunks,
-           "Call-style alias for the num_chunks property");
+           "Per-chunk geometry, in order");
 
   m.def("get_composite_address", &spyre::get_composite_address_handle,
         "Return a read-only handle over the device address backing a Spyre "
