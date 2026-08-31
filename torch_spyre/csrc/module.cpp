@@ -269,7 +269,8 @@ PYBIND11_MODULE(_C, m) {
                   py::arg("name"))
       .def("slot_count", &flex::SharedHostPool::SlotCount)
       .def("slot_bytes", &flex::SharedHostPool::SlotBytes)
-      .def("name", &flex::SharedHostPool::Name);
+      .def("name", &flex::SharedHostPool::Name)
+      .def("total_bytes", &flex::SharedHostPool::TotalBytes);
 
   dci_cls.def_readonly("device_size", &spyre::SpyreTensorLayout::device_size)
       .def_readonly("stride_map", &spyre::SpyreTensorLayout::stride_map)
