@@ -60,7 +60,7 @@ class TestSpyre(TestCase):
         # H2D: Move tensor back from host memory pool to spyre
         copy_tensor_raw(kv_page_tensor_reload, pool, slot_id, to_device=True)
 
-        self.assertEqual(kv_page_tensor, kv_page_tensor_reload)
+        self.assertEqual(kv_page_tensor.to("cpu"), kv_page_tensor_reload.to("cpu"))
 
     def test_kv_offload_reload_zeroed(self):
         tensor_on_spyre = torch.randn(10, device="spyre", dtype=torch.float16)
@@ -122,9 +122,12 @@ class TestSpyre(TestCase):
 
         pid = os.fork()
         if pid == 0:
-            # D2H: Move tensor from spyre to host memory pool
-            copy_tensor_raw(kv_page_tensor, pool, slot_id, to_device=False)
-            os._exit(0)
+            try:
+                # D2H: Move tensor from spyre to host memory pool
+                copy_tensor_raw(kv_page_tensor, pool, slot_id, to_device=False)
+                os._exit(0)
+            except Exception:
+                os._exit(1)
 
         _, status = os.waitpid(pid, 0)
         self.assertEqual(status, 0)
@@ -135,7 +138,9 @@ class TestSpyre(TestCase):
         copy_tensor_raw(kv_page_tensor_reload, pool, slot_id, to_device=True)
 
         # Verify that the tensor matches the original
-        self.assertTrue(torch.equal(kv_page_tensor, kv_page_tensor_reload))
+        self.assertTrue(
+            torch.equal(kv_page_tensor.to("cpu"), kv_page_tensor_reload.to("cpu"))
+        )
 
 
 if __name__ == "__main__":
