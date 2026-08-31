@@ -66,11 +66,15 @@ class SpyreStream {
                  DataFormats dtype, bool use_dmai) const;
 
   // Byte-exact host<->device DMA used by the KV-offload path. Routes straight
-  // through flex::RuntimeStream::copyRaw with no layout conversion: the host
-  // side is a shared-pool slot and the bytes are moved verbatim.
-  // `host_capacity` is the addressable length at `host_address` (the pool's
-  // SlotBytes()); copyRaw rejects a capacity smaller than the device region.
-  void copyRaw(void* host_address, size_t host_capacity,
+  // through flex::RuntimeStream::copyRaw with no layout conversion: the bytes
+  // are moved verbatim between a shared-pool slot and the device allocation.
+  //
+  // Slot-addressed: the raw host address is resolved inside the runtime via
+  // SharedHostPool::SlotPtr (private to the pool, and RuntimeStream is already
+  // its friend), so no host pointer passes through torch-spyre. flex also
+  // supplies pool.SlotBytes() as the host capacity internally, so the bounds
+  // check cannot be got wrong here.
+  void copyRaw(const flex::SharedHostPool& pool, uint64_t slot,
                const flex::CompositeAddress* device_address,
                bool to_device) const;
 

@@ -46,42 +46,6 @@
 
 namespace py = pybind11;
 
-namespace flex {
-
-// flex::SharedHostPool::SlotPtr is private: the raw host address is
-// deliberately not part of the pool's public surface. shared_host_pool.hpp
-// nonetheless declares
-//   friend class SharedHostPoolTestAccessor;
-// and flex never defines that class inside its own library -- only in its own
-// test file. Defining it here uses the access flex's shipped header already
-// grants, rather than widening flex's public API or const_cast-ing around it.
-// It must live directly in namespace flex: that is the scope the friend
-// declaration implicitly forward-declares, and a same-named class in any other
-// namespace is an unrelated type that the friendship does not cover.
-//
-// This is the same escape hatch flex uses to drive copyRaw from its own tests
-// (see SharedHostPoolTestAccessor in shared_host_pool_test.cpp). It is a
-// stopgap: the intended production path is a pool-aware overload on the
-// runtime,
-//   RuntimeStream::copyRaw(const SharedHostPool&, size_t slot, ...)
-// which the sibling `friend class RuntimeStream` declaration anticipates but
-// which flex has not added yet. Drop this shim once that lands.
-class SharedHostPoolTestAccessor {
- public:
-  explicit SharedHostPoolTestAccessor(const SharedHostPool* pool)
-      : pool_(pool) {}
-
-  // Forwards SlotPtr()'s std::out_of_range when slot >= SlotCount().
-  void* SlotPtr(uint64_t slot) const {
-    return pool_->SlotPtr(slot);
-  }
-
- private:
-  const SharedHostPool* pool_;
-};
-
-}  // namespace flex
-
 namespace spyre {
 
 /*
@@ -642,12 +606,13 @@ void copy_tensor_raw(const at::Tensor& dev_tensor,
   c10::Device device = dev_tensor.device();
   SpyreStream stream = getCurrentStream(device);
 
-  void* host_address = flex::SharedHostPoolTestAccessor(&pool).SlotPtr(slot_id);
-
   const flex::CompositeAddress* composite_address =
       spyre::get_composite_address(dev_tensor);
 
-  stream.copyRaw(host_address, pool.SlotBytes(), composite_address, to_device);
+  // Slot-addressed: flex resolves the host address from the pool internally, so
+  // no raw host pointer passes through torch-spyre, and flex supplies
+  // pool.SlotBytes() as the capacity itself.
+  stream.copyRaw(pool, slot_id, composite_address, to_device);
 
   if (!non_blocking) {
     stream.synchronize();

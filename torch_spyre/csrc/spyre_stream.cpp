@@ -21,6 +21,8 @@
 #include <c10/core/Stream.h>
 
 #include <cstddef>
+#include <cstdint>
+#include <flex/memory_interface/shared_host_pool.hpp>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -270,12 +272,11 @@ void SpyreStream::fillAsync(const flex::CompositeAddress* dst, double value,
   resolveRuntimeHandle()->fillAsync(dst, value, dtype, use_dmai);
 }
 
-void SpyreStream::copyRaw(void* host_address, size_t host_capacity,
+void SpyreStream::copyRaw(const flex::SharedHostPool& pool, uint64_t slot,
                           const flex::CompositeAddress* device_address,
                           bool to_device) const {
   RECORD_FUNCTION("launch::CopyRaw", {});
-  resolveRuntimeHandle()->copyRaw(host_address, host_capacity, device_address,
-                                  to_device);
+  resolveRuntimeHandle()->copyRaw(pool, slot, device_address, to_device);
 }
 
 void SpyreStream::launch(const JobPlan& plan,
