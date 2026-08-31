@@ -606,12 +606,13 @@ void copy_tensor_raw(const at::Tensor& dev_tensor,
   c10::Device device = dev_tensor.device();
   SpyreStream stream = getCurrentStream(device);
 
-  void* host_address = pool.slot_ptr(slot_id);
-
   const flex::CompositeAddress* composite_address =
       spyre::get_composite_address(dev_tensor);
 
-  stream.copyRaw(host_address, pool.slot_bytes(), composite_address, to_device);
+  // Slot-addressed: flex resolves the host address from the pool internally, so
+  // no raw host pointer passes through torch-spyre, and flex supplies
+  // pool.SlotBytes() as the capacity itself.
+  stream.copyRaw(pool, slot_id, composite_address, to_device);
 
   if (!non_blocking) {
     stream.synchronize();

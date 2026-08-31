@@ -19,6 +19,8 @@
 #include <ATen/ATen.h>
 #include <c10/util/intrusive_ptr.h>
 
+#include <flex/memory_interface/shared_host_pool.hpp>
+
 #include "module.h"
 
 namespace spyre {

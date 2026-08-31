@@ -448,6 +448,11 @@ PYBIND11_MODULE(_C, m) {
         "tensor's storage; the handle keeps that allocation alive",
         py::arg("tensor"));
 
+  // Name alias: #3915/#3964 import get_composite_address_handle, #3587 binds
+  // get_composite_address. Both names refer to the same accessor.
+  m.def("get_composite_address_handle", &spyre::get_composite_address_handle,
+        "Alias for get_composite_address", py::arg("tensor"));
+
   // Stream management functions
   m.def("get_stream_from_pool", &spyre::getStreamFromPool, py::arg("device"),
         py::arg("priority") = 0,

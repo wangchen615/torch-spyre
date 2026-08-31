@@ -109,8 +109,10 @@ std::shared_ptr<spyre_comms::Context> ensure_context() {
   auto context = spyre_comms::get_world_context();
   if (context == nullptr) {
     DEBUGINFO("Initializing spyre-comms library");
-    spyre_comms::initialize_library(spyre::GlobalRuntime::get(),
-                                    spyre::getDefaultStreamRuntimeHandle());
+    const int init_rc = spyre_comms::initialize_library(
+        spyre::GlobalRuntime::get(), spyre::getDefaultStreamRuntimeHandle());
+    TORCH_CHECK(init_rc == 0, "Failed to initialize spyre-comms (rc=", init_rc,
+                ")");
     context = spyre_comms::get_world_context();
     TORCH_CHECK(context != nullptr, "Failed to get spyre-comms world context");
   }

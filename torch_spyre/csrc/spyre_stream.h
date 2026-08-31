@@ -65,6 +65,19 @@ class SpyreStream {
   void fillAsync(const flex::CompositeAddress* dst, double value,
                  DataFormats dtype, bool use_dmai) const;
 
+  // Byte-exact host<->device DMA used by the KV-offload path. Routes straight
+  // through flex::RuntimeStream::copyRaw with no layout conversion: the bytes
+  // are moved verbatim between a shared-pool slot and the device allocation.
+  //
+  // Slot-addressed: the raw host address is resolved inside the runtime via
+  // SharedHostPool::SlotPtr (private to the pool, and RuntimeStream is already
+  // its friend), so no host pointer passes through torch-spyre. flex also
+  // supplies pool.SlotBytes() as the host capacity internally, so the bounds
+  // check cannot be got wrong here.
+  void copyRaw(const flex::SharedHostPool& pool, uint64_t slot,
+               const flex::CompositeAddress* device_address,
+               bool to_device) const;
+
   // Conversions
   c10::Stream unwrap() const;
 
