@@ -51,6 +51,27 @@ class GlobalRuntime {
     return s;
   }
 };
+
+// Borrowed shared_ptr to the global RuntimeContext, for APIs that ask for one.
+//
+// spyre_comms::initialize_library takes std::shared_ptr<flex::RuntimeContext>
+// and stores it for the library's lifetime, but the context is NOT ours to
+// hand out ownership of: flex::RuntimeContext::create() documents its result
+// as a "Non-owning pointer to the RuntimeContext singleton", flex owns it, and
+// GlobalRuntime only borrows it (freeRuntime() nulls the handle, it does not
+// delete). Wrapping it in a default-deleter shared_ptr would let the last
+// external reference call delete on a flex-owned singleton -- heap corruption
+// at teardown, in a path that otherwise looks correct.
+//
+// Hence the no-op deleter: the callee gets a valid, copyable shared_ptr whose
+// destructor does nothing. Returns nullptr when the runtime is not yet started,
+// which callers must treat as an error (spyre_comms rejects a null runtime).
+inline std::shared_ptr<flex::RuntimeContext> borrowed_runtime_context() {
+  flex::RuntimeContext* runtime = GlobalRuntime::get();
+  if (runtime == nullptr) return nullptr;
+  return std::shared_ptr<flex::RuntimeContext>(runtime,
+                                               [](flex::RuntimeContext*) {});
+}
 bool get_downcast_warn_enabled();
 bool is_supported_dtype(c10::ScalarType dtype);
 DataFormats get_device_dtype(c10::ScalarType torch_dtype);

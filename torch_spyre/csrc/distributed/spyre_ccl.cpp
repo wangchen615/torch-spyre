@@ -45,8 +45,14 @@ SpyreCCLBackend::SpyreCCLBackend(const c10::intrusive_ptr<::c10d::Store>& store,
    * Start the communication library
    * Pass it the shared runtime library handle, and default stream.
    */
-  spyre_comms::initialize_library(spyre::GlobalRuntime::get(),
-                                  spyre::getDefaultStreamRuntimeHandle());
+  const int init_rc =
+      spyre_comms::initialize_library(spyre::borrowed_runtime_context(),
+                                      spyre::getDefaultStreamRuntimeHandle());
+  if (0 != init_rc) {
+    throw std::runtime_error("[" + getBackendName() +
+                             "]: Failed to initialize spyre-comms (rc=" +
+                             std::to_string(init_rc) + ")");
+  }
   group_context_ = spyre_comms::get_world_context();
   if (nullptr == group_context_) {
     std::string _err_msg =
