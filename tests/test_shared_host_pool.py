@@ -53,6 +53,13 @@ class TestSharedHostPool(TestCase):
         # larger due to alignment of size/stride of the pool
         self.assertGreaterEqual(shared_pool.slot_bytes(), 5)
 
+    def test_name(self):
+        # Create a shared pool
+        shared_pool = SharedHostPool.create_or_attach("Testing", 5, 5)
+
+        # Check if name is as expected
+        self.assertEqual(shared_pool.name(), "Testing")
+
     def test_attach_existing_pool(self):
         # Create a shared pool and assign to _ to keep it alive
         _ = SharedHostPool.create_or_attach("Testing", 5, 5)
