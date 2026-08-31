@@ -21,9 +21,37 @@
 # Set USE_SPYRE_CCL=1 in your environment to build with Multi-Spyre; the default
 # below leaves it off so single-device builds stay fast.
 
-FLEX_SRC="$HOME/dt-inductor/flex/flex/include"
-FLEX_LIB="$HOME/dt-inductor/build/senbfcc/flex"
+# PATHS MOVED 2026-08-31 (flex rebase + rebuild):
+#   library: build/senbfcc/flex/libflex.so  ->  build/senbfcc/libflex.so
+#            (no /flex suffix any more; the old directory is GONE, so a stale
+#             path fails loudly rather than silently falling through)
+#   headers: flex/flex/include             ->  flex/include
+#            (flex/flex/include/flex now holds only the generated flex_export.h,
+#             which is a decoy: pointing there yields confusing "no such file"
+#             errors instead of a clean failure)
+#
+# FLEX_SRC below is a STAGED header tree, not the flex working tree. The flex
+# checkout is currently on pr1569/yue-round2, which carries only #1569 and so
+# has neither shared_host_pool.hpp nor the slot-addressed copyRaw declaration --
+# even though the built library exports both. The staging dir is extracted from
+# origin/kvc-offload-dev (git archive, no checkout) so the flex working tree is
+# left untouched. Refresh it with scripts/kvc-stage-flex-headers.sh.
+FLEX_SRC="$HOME/dt-inductor/build/flex-hdr-kvc/include"
+FLEX_LIB="$HOME/dt-inductor/build/senbfcc"
 SENTIENT="$HOME/dt-inductor/sentient"
+
+# Fail loudly if the expected flex artifacts are missing, rather than letting the
+# build fall through to the stale Aug 19 library/headers under sentient/.
+if [[ ! -f "$FLEX_LIB/libflex.so" ]]; then
+  echo "kvc-build-env: ERROR: no libflex.so at $FLEX_LIB" >&2
+  echo "  (did the flex build move again? check build/senbfcc/)" >&2
+  return 1 2>/dev/null || exit 1
+fi
+if [[ ! -f "$FLEX_SRC/flex/memory_interface/shared_host_pool.hpp" ]]; then
+  echo "kvc-build-env: ERROR: staged flex headers missing shared_host_pool.hpp" >&2
+  echo "  run scripts/kvc-stage-flex-headers.sh" >&2
+  return 1 2>/dev/null || exit 1
+fi
 
 export LD_LIBRARY_PATH="$FLEX_LIB:$LD_LIBRARY_PATH"
 export CMAKE_INCLUDE_PATH="$FLEX_SRC:$SENTIENT/deeptools/include:$SENTIENT/runtime/include:$SENTIENT/spyre_comms/include:/opt/ibm/spyre/senlib/include"
