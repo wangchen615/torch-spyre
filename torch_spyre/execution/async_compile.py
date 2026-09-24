@@ -57,8 +57,45 @@ logger = get_inductor_logger("sdsc_compile")
 # both the bundle and the KTIR path. It bounds a wedged compiler -- which would
 # otherwise block torch.compile forever with no diagnostic -- rather than
 # policing slowness: both finish in well under a second on a small kernel.
-# Raise it if a large bundle legitimately needs longer.
-_COMPILE_TIMEOUT_S = 60.0
+#
+# Large attention bundles can legitimately exceed the default. A timed-out
+# compile writes no cache entry, so the shape is retried from cold by every
+# later layer, and at serve time the same timeout surfaces as
+# BackendCompilerFailed -- which kills the engine rather than degrading it.
+# Override with TORCH_SPYRE_COMPILE_TIMEOUT (seconds) when a bundle needs
+# longer; `0` disables the ceiling entirely.
+_COMPILE_TIMEOUT_DEFAULT_S = 60.0
+_COMPILE_TIMEOUT_ENV = "TORCH_SPYRE_COMPILE_TIMEOUT"
+
+
+def _compile_timeout_s() -> float | None:
+    """Read the backend-compile ceiling, in seconds, from the environment.
+
+    Returns None for "no ceiling", which is what subprocess.run expects for an
+    unbounded wait. Rejects a malformed or negative value instead of falling
+    back to the default: silently ignoring the override would leave a wedged
+    compiler bounded at 60 s while the operator believes it is not, and the
+    resulting failure looks like a compiler bug rather than a typo.
+    """
+    raw = os.environ.get(_COMPILE_TIMEOUT_ENV)
+    if raw is None or raw == "":
+        return _COMPILE_TIMEOUT_DEFAULT_S
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError(
+            f"{_COMPILE_TIMEOUT_ENV}={raw!r} is not a number. Set it to a "
+            f"timeout in seconds, or 0 to disable the ceiling."
+        ) from None
+    if value < 0:
+        raise ValueError(
+            f"{_COMPILE_TIMEOUT_ENV}={raw!r} is negative. Set it to a timeout "
+            f"in seconds, or 0 to disable the ceiling."
+        )
+    return value or None
+
+
+_COMPILE_TIMEOUT_S = _compile_timeout_s()
 
 
 def _check_ktir_device_prerequisites() -> None:
@@ -227,8 +264,10 @@ def _run_backend_compiler(
                 code_dir=compile_dir,
             )
             raise RuntimeError(
-                f"dbo-opt timed out after {_COMPILE_TIMEOUT_S}s "
-                f"(_COMPILE_TIMEOUT_S).\ncommand: {' '.join(cmd)}"
+                f"dbo-opt timed out after {_COMPILE_TIMEOUT_S}s. Raise "
+                f"{_COMPILE_TIMEOUT_ENV} (seconds, or 0 for no ceiling) if "
+                f"this bundle legitimately needs longer.\n"
+                f"command: {' '.join(cmd)}"
             ) from exc
         except subprocess.CalledProcessError as exc:
             try_collect(
@@ -609,7 +648,9 @@ class SpyreAsyncCompile(AsyncCompile):
                 )
                 raise RuntimeError(
                     f"OpSpec->KTIR: dbo-opt timed out after "
-                    f"{_COMPILE_TIMEOUT_S}s (_COMPILE_TIMEOUT_S).\n"
+                    f"{_COMPILE_TIMEOUT_S}s. Raise {_COMPILE_TIMEOUT_ENV} "
+                    f"(seconds, or 0 for no ceiling) if this bundle "
+                    f"legitimately needs longer.\n"
                     f"command: {' '.join(cmd)}"
                 ) from exc
             except subprocess.CalledProcessError as exc:
