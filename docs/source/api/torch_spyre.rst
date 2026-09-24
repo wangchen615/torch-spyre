@@ -643,6 +643,12 @@ Environment Variables
    * - ``TORCH_SPYRE_NUM_HOST_COMPUTE_STREAMS``
      - Size of the host-compute stream pool used by program correction
        (default ``4``, maximum ``8``)
+   * - ``TORCH_SPYRE_COMPILE_TIMEOUT``
+     - Wall-clock ceiling in seconds on one backend-compiler (``dbo-opt``)
+       invocation (default ``60``; ``0`` disables the ceiling). Raise it when a
+       large bundle legitimately needs longer: a timed-out compile writes no
+       cache entry, so the shape recompiles from cold on every later layer, and
+       at serve time the timeout surfaces as ``BackendCompilerFailed``
    * - ``SPYRE_INDUCTOR_LOG=1``
      - *Deprecated*. Use ``TORCH_LOGS='torch_spyre.inductor'``. Enables Spyre
        Inductor logging (INFO level)
