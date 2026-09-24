@@ -463,6 +463,16 @@ PYBIND11_MODULE(_C, m) {
         py::arg("to_device"), py::arg("non_blocking") = false,
         py::call_guard<py::gil_scoped_release>());
 
+  m.def("copy_kv_page_raw", &spyre::copy_kv_page_raw,
+        "Copy one KV cache page between a shared host pool slot and the "
+        "device. Takes the full cache and a block id; validates the production "
+        "KV-page contract and derives the physical page range from the device "
+        "layout. Throws before any DMA if the contract does not hold.",
+        py::arg("cache"), py::arg("block_id"), py::arg("pool"),
+        py::arg("slot_id"), py::arg("to_device"),
+        py::arg("non_blocking") = false,
+        py::call_guard<py::gil_scoped_release>());
+
   // Device-side fill using FillDMA (no host buffer or H2D copy)
   m.def("fill_tensor", &spyre::spyre_fill_tensor,
         "Fill a spyre tensor with a scalar value using device-side FillDMA",
