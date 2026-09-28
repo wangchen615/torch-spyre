@@ -2304,11 +2304,17 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # solver then runs its fallback objective, under which every copy is
         # pinned out.
         if cost_expr is not None:
-            for copy in sorted(
+            # Build the sum in ONE Add. Rebinding cost_expr per copy makes a fresh
+            # Add each time, and Add.flatten re-sorts every term accumulated so far
+            # via _addsort/compare -- O(N^2 log N) to build N terms. At
+            # max_model_len=16384 that single loop ran ~7.2 h before the solver was
+            # reached. sorted() stays: it keeps construction deterministic for the
+            # dump_cost_expr_file record below.
+            copies = sorted(
                 (b for b in solver.buffers if isinstance(b, RelayoutCopyBuffer)),
                 key=lambda b: b.name,
-            ):
-                cost_expr = cost_expr + copy.cost_term()
+            )
+            cost_expr = sympy.Add(cost_expr, *(c.cost_term() for c in copies))
         result = solver.plan_layout_and_core_divisions(cost_expr)
         assert not any(buffer.lx_relayout_plans for buffer in result), (
             "CoOptimizingAllocator does not support LX relayout"
