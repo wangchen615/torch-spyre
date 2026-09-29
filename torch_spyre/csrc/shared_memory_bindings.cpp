@@ -17,13 +17,18 @@
 #include "shared_memory_bindings.h"
 
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 
+#include <cstdint>
 #include <flex/memory_interface/shared_data_pool.hpp>
 #include <flex/memory_interface/shared_host_pool.hpp>
+#include <flex/memory_interface/shared_metadata.hpp>
 #include <flex/memory_interface/shared_pool.hpp>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "module.h"
 
@@ -32,6 +37,75 @@ namespace py = pybind11;
 namespace torch_spyre::shared_memory {
 
 void init_shared_memory_bindings(py::module_& m) {
+  py::enum_<flex::SharedPoolKind>(m, "SharedPoolKind")
+      .value("HOST", flex::SharedPoolKind::HOST);
+
+  py::class_<flex::CompatibilityDescriptor>(m, "CompatibilityDescriptor")
+      .def(py::init([](uint32_t format_version, std::vector<uint8_t> data) {
+        return flex::CompatibilityDescriptor{format_version, std::move(data)};
+      }))
+      .def_readwrite("format_version",
+                     &flex::CompatibilityDescriptor::format_version)
+      .def_readwrite("data", &flex::CompatibilityDescriptor::data);
+
+  py::class_<flex::SharedDataPoolConfig>(m, "SharedDataPoolConfig")
+      .def(py::init([](std::string name, flex::SharedPoolKind kind,
+                       size_t num_slots, size_t slot_bytes,
+                       flex::CompatibilityDescriptor compatibility) {
+        return flex::SharedDataPoolConfig{std::move(name), kind, num_slots,
+                                          slot_bytes, std::move(compatibility)};
+      }))
+      .def_readwrite("name", &flex::SharedDataPoolConfig::name)
+      .def_readwrite("kind", &flex::SharedDataPoolConfig::kind)
+      .def_readwrite("num_slots", &flex::SharedDataPoolConfig::num_slots)
+      .def_readwrite("slot_bytes", &flex::SharedDataPoolConfig::slot_bytes)
+      .def_readwrite("compatibility",
+                     &flex::SharedDataPoolConfig::compatibility);
+
+  py::class_<flex::SharedMetadataCapacity>(m, "SharedMetadataCapacity")
+      .def(py::init([](uint32_t max_pools, uint64_t max_slots_per_pool,
+                       uint32_t max_compatibilities) {
+        return flex::SharedMetadataCapacity{max_pools, max_slots_per_pool,
+                                            max_compatibilities};
+      }))
+      .def_readwrite("max_pools", &flex::SharedMetadataCapacity::max_pools)
+      .def_readwrite("max_slots_per_pool",
+                     &flex::SharedMetadataCapacity::max_slots_per_pool)
+      .def_readwrite("max_compatibilities",
+                     &flex::SharedMetadataCapacity::max_compatibilities);
+
+  py::class_<flex::SharedMetadataConfig>(m, "SharedMetadataConfig")
+      .def(py::init([](uint32_t max_chunks,
+                       std::vector<flex::SharedDataPoolConfig> pools,
+                       std::optional<flex::SharedMetadataCapacity> capacity) {
+             return flex::SharedMetadataConfig{max_chunks, std::move(pools),
+                                               std::move(capacity)};
+           }),
+           py::arg("max_chunks"), py::arg("pools"),
+           py::arg("capacity") = std::nullopt)
+      .def_readwrite("max_chunks", &flex::SharedMetadataConfig::max_chunks)
+      .def_readwrite("pools", &flex::SharedMetadataConfig::pools)
+      .def_readwrite("capacity", &flex::SharedMetadataConfig::capacity);
+
+  py::class_<flex::CompatibilityRef>(m, "CompatibilityRef")
+      .def_readonly("metadata_version",
+                    &flex::CompatibilityRef::metadata_version)
+      .def_readonly("compatibility_id",
+                    &flex::CompatibilityRef::compatibility_id);
+
+  py::class_<flex::PoolRef>(m, "PoolRef")
+      .def_readonly("metadata_version", &flex::PoolRef::metadata_version)
+      .def_readonly("pool_id", &flex::PoolRef::pool_id)
+      .def_readonly("pool_version", &flex::PoolRef::pool_version);
+
+  py::class_<flex::RegisteredPool>(m, "RegisteredPool")
+      .def_readonly("pool_ref", &flex::RegisteredPool::pool_ref)
+      .def_readonly("compatibility", &flex::RegisteredPool::compatibility)
+      .def_readonly("name", &flex::RegisteredPool::name)
+      .def_readonly("kind", &flex::RegisteredPool::kind)
+      .def_readonly("slot_count", &flex::RegisteredPool::slot_count)
+      .def_readonly("slot_bytes", &flex::RegisteredPool::slot_bytes);
+
   py::class_<flex::SharedPool, std::shared_ptr<flex::SharedPool>>(m,
                                                                   "SharedPool")
       .def("name", &flex::SharedPool::Name);
@@ -56,6 +130,42 @@ void init_shared_memory_bindings(py::module_& m) {
           py::arg("name"), py::arg("num_slots"), py::arg("slot_bytes"))
       .def_static("unlink_by_name", &flex::SharedHostPool::UnlinkByName,
                   py::arg("name"), py::call_guard<py::gil_scoped_release>());
+
+  py::class_<flex::SharedMetadata, flex::SharedPool,
+             std::shared_ptr<flex::SharedMetadata>>(m, "SharedMetadata")
+      .def_static(
+          "create_or_attach",
+          [](const std::string& name,
+             const flex::SharedMetadataConfig& config) {
+            spyre::startRuntime();
+            py::gil_scoped_release release;
+            auto metadata = flex::SharedMetadata::CreateOrAttach(
+                spyre::GlobalRuntime::get(), name, config);
+            return std::shared_ptr<flex::SharedMetadata>(std::move(metadata));
+          },
+          py::arg("name"), py::arg("config"))
+      .def_static("unlink_by_name", &flex::SharedMetadata::UnlinkByName,
+                  py::arg("name"), py::call_guard<py::gil_scoped_release>())
+      .def("pool_count", &flex::SharedMetadata::PoolCount,
+           py::call_guard<py::gil_scoped_release>())
+      .def("version", &flex::SharedMetadata::Version)
+      .def("find_pool", &flex::SharedMetadata::FindPool, py::arg("name"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("register_or_attach_pool",
+           &flex::SharedMetadata::RegisterOrAttachPool, py::arg("config"),
+           py::call_guard<py::gil_scoped_release>())
+      .def(
+          "resolve_pool",
+          [](flex::SharedMetadata& metadata, const flex::PoolRef& ref) {
+            auto resolved = [&]() {
+              py::gil_scoped_release release;
+              return metadata.ResolvePool(ref);
+            }();
+            return std::const_pointer_cast<flex::SharedDataPool>(resolved);
+          },
+          py::arg("pool_ref"))
+      .def("retire_pool", &flex::SharedMetadata::RetirePool,
+           py::arg("pool_ref"), py::call_guard<py::gil_scoped_release>());
 }
 
 }  // namespace torch_spyre::shared_memory
