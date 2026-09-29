@@ -145,6 +145,8 @@ void init_shared_memory_bindings(py::module_& m) {
   py::class_<flex::NoSpace>(m, "NoSpace");
   py::class_<flex::Unavailable>(m, "Unavailable");
 
+  py::class_<flex::SlotReadPin>(m, "SlotReadPin");
+
   py::class_<flex::SharedPool, std::shared_ptr<flex::SharedPool>>(m,
                                                                   "SharedPool")
       .def("name", &flex::SharedPool::Name);
@@ -207,6 +209,20 @@ void init_shared_memory_bindings(py::module_& m) {
            py::arg("pool_ref"), py::call_guard<py::gil_scoped_release>())
       .def("lookup", &flex::SharedMetadata::Lookup, py::arg("key"),
            py::call_guard<py::gil_scoped_release>())
+      .def(
+          "pin_read",
+          [](flex::SharedMetadata& metadata,
+             const flex::LookupEntry& entry) -> py::object {
+            auto pin = [&]() {
+              py::gil_scoped_release release;
+              return metadata.PinRead(entry);
+            }();
+            if (!pin.has_value()) {
+              return py::none();
+            }
+            return py::cast(std::move(*pin));
+          },
+          py::arg("entry"), py::keep_alive<0, 1>())
       .def(
           "claim",
           [](flex::SharedMetadata& metadata, const flex::PoolRef& target_pool,

@@ -14,6 +14,11 @@
 
 
 import os
+import multiprocessing
+import threading
+import time
+import unittest
+from queue import Empty
 
 from torch.testing._internal.common_utils import TestCase, run_tests
 
@@ -26,12 +31,107 @@ from torch_spyre._C import (  # type: ignore[attr-defined]
     Reservation,
     SharedDataPool,
     SharedDataPoolConfig,
+    SharedHostPool,
     SharedMetadata,
     SharedMetadataCapacity,
     SharedMetadataConfig,
     SharedPoolKind,
+    SlotReadPin,
     Unavailable,
 )
+
+
+def _run_gil_progress_test(name, ready, result_queue):
+    pool_name = f"{name}.pool"
+    try:
+        compatibility = CompatibilityDescriptor(1, [1])
+        config = SharedDataPoolConfig(
+            pool_name, SharedPoolKind.HOST, 1, 128, compatibility
+        )
+        md = SharedMetadata.create_or_attach(
+            name, SharedMetadataConfig(1, [config], None)
+        )
+        registered = md.find_pool(pool_name)
+        key = CompatibleBlockKey(registered.compatibility, 0x3001)
+        reservation = md.claim(registered.pool_ref, key)
+        md.publish(reservation, [ChunkDescriptorEntry(0, 128)])
+        entry = md.lookup(key)
+        pin = md.pin_read(entry)
+        ready.set()
+
+        started = threading.Event()
+        finished = threading.Event()
+        progress = []
+        evicted = []
+
+        def evict_pinned_entry():
+            started.set()
+            evicted.append(md.evict(entry))
+            finished.set()
+
+        worker = threading.Thread(target=evict_pinned_entry)
+        worker.start()
+        if not started.wait(5):
+            raise AssertionError("eviction worker did not start")
+        time.sleep(0.1)
+        blocked_before_release = not finished.is_set()
+        progress.append("main-thread-ran")
+        del pin
+        worker.join(5)
+        result_queue.put(
+            (
+                "ok",
+                blocked_before_release,
+                progress,
+                worker.is_alive(),
+                evicted,
+            )
+        )
+    except BaseException as error:
+        result_queue.put(("error", repr(error)))
+        ready.set()
+
+
+class TestSharedMetadataGIL(unittest.TestCase):
+    def test_blocked_evict_releases_gil(self):
+        name = f"{self.id()}.{os.getpid()}"
+        pool_name = f"{name}.pool"
+        SharedMetadata.unlink_by_name(name)
+        SharedHostPool.unlink_by_name(pool_name)
+        self.addCleanup(SharedMetadata.unlink_by_name, name)
+        self.addCleanup(SharedHostPool.unlink_by_name, pool_name)
+
+        context = multiprocessing.get_context("spawn")
+        ready = context.Event()
+        result_queue = context.Queue()
+        process = context.Process(
+            target=_run_gil_progress_test, args=(name, ready, result_queue)
+        )
+        process.start()
+        if not ready.wait(60):
+            process.terminate()
+            process.join(5)
+            self.fail("child did not finish shared-metadata setup")
+        process.join(10)
+        if process.is_alive():
+            process.terminate()
+            process.join(5)
+            self.fail("child deadlocked while eviction waited for a read pin")
+        self.assertEqual(process.exitcode, 0)
+        try:
+            result = result_queue.get(timeout=2)
+        except Empty as error:
+            self.fail(f"child returned no GIL progress result: {error}")
+        finally:
+            result_queue.close()
+            result_queue.join_thread()
+
+        self.assertEqual(result[0], "ok", result)
+        _, blocked_before_release, progress, worker_alive, evicted = result
+        self.assertTrue(blocked_before_release)
+        self.assertEqual(progress, ["main-thread-ran"])
+        self.assertFalse(worker_alive)
+        self.assertEqual(evicted, [True])
 
 
 class TestSharedMetadata(TestCase):
@@ -187,6 +287,33 @@ class TestSharedMetadata(TestCase):
         self.assertTrue(existing.valid)
         self.assertEqual(existing.slot.pool.pool_id, pool_a.pool_ref.pool_id)
         self.assertEqual(md.lookup(key).slot.pool.pool_id, pool_a.pool_ref.pool_id)
+
+    def test_stale_entry_cannot_pin_or_evict_reused_slot(self):
+        md, registered = self.create_metadata(slots=1)
+        old_key = CompatibleBlockKey(registered.compatibility, 0x2501)
+        old_reservation = md.claim(registered.pool_ref, old_key)
+        self.assertIsInstance(old_reservation, Reservation)
+        md.publish(old_reservation, [ChunkDescriptorEntry(0, 128)])
+        old_entry = md.lookup(old_key)
+        self.assertIsNotNone(old_entry)
+        self.assertTrue(md.evict(old_entry))
+
+        new_key = CompatibleBlockKey(registered.compatibility, 0x2502)
+        new_reservation = md.claim(registered.pool_ref, new_key)
+        self.assertIsInstance(new_reservation, Reservation)
+        self.assertEqual(new_reservation.slot.slot_id, old_entry.slot.slot_id)
+        self.assertNotEqual(
+            new_reservation.slot.slot_version, old_entry.slot.slot_version
+        )
+        md.publish(new_reservation, [ChunkDescriptorEntry(0, 128)])
+
+        self.assertIsNone(md.pin_read(old_entry))
+        self.assertFalse(md.evict(old_entry))
+        new_entry = md.lookup(new_key)
+        self.assertIsNotNone(new_entry)
+        pin = md.pin_read(new_entry)
+        self.assertIsInstance(pin, SlotReadPin)
+        del pin
 
 
 if __name__ == "__main__":
