@@ -192,9 +192,10 @@ void init_shared_memory_bindings(py::module_& m) {
           [](const std::string& name,
              const flex::SharedMetadataConfig& config) {
             spyre::startRuntime();
+            const auto config_snapshot = config;
             py::gil_scoped_release release;
             auto metadata = flex::SharedMetadata::CreateOrAttach(
-                spyre::GlobalRuntime::get(), name, config);
+                spyre::GlobalRuntime::get(), name, config_snapshot);
             return std::shared_ptr<flex::SharedMetadata>(std::move(metadata));
           },
           py::arg("name"), py::arg("config"))
@@ -205,9 +206,15 @@ void init_shared_memory_bindings(py::module_& m) {
       .def("version", &flex::SharedMetadata::Version)
       .def("find_pool", &flex::SharedMetadata::FindPool, py::arg("name"),
            py::call_guard<py::gil_scoped_release>())
-      .def("register_or_attach_pool",
-           &flex::SharedMetadata::RegisterOrAttachPool, py::arg("config"),
-           py::call_guard<py::gil_scoped_release>())
+      .def(
+          "register_or_attach_pool",
+          [](flex::SharedMetadata& metadata,
+             const flex::SharedDataPoolConfig& config) {
+            const auto config_snapshot = config;
+            py::gil_scoped_release release;
+            return metadata.RegisterOrAttachPool(config_snapshot);
+          },
+          py::arg("config"))
       .def(
           "resolve_pool",
           [](flex::SharedMetadata& metadata, const flex::PoolRef& ref) {
@@ -219,7 +226,10 @@ void init_shared_memory_bindings(py::module_& m) {
           },
           py::arg("pool_ref"))
       .def("retire_pool", &flex::SharedMetadata::RetirePool,
-           py::arg("pool_ref"), py::call_guard<py::gil_scoped_release>())
+           py::arg("pool_ref"), py::call_guard<py::gil_scoped_release>(),
+           "Retire a pool only after the caller establishes host-wide DMA "
+           "quiescence. Retirement does not drain read pins or synchronize "
+           "DMA.")
       .def("lookup", &flex::SharedMetadata::Lookup, py::arg("key"),
            py::call_guard<py::gil_scoped_release>())
       .def(

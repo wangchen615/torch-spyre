@@ -15,6 +15,7 @@
 
 import os
 import multiprocessing
+import sys
 import threading
 import time
 from queue import Empty
@@ -136,6 +137,159 @@ def test_blocked_evict_releases_gil():
         result_queue.join_thread()
         SharedMetadata.unlink_by_name(name)
         SharedHostPool.unlink_by_name(pool_name)
+
+
+def _run_config_snapshot_test(name, result_queue):
+    original_pool_name = f"{name}.pool-a"
+    mutated_pool_name = f"{name}.pool-b"
+    metadata = None
+    try:
+        creation_pool_config = SharedDataPoolConfig(
+            original_pool_name,
+            SharedPoolKind.HOST,
+            1,
+            128,
+            CompatibilityDescriptor(1, [1]),
+        )
+        creation_config = SharedMetadataConfig(
+            1,
+            [creation_pool_config],
+            SharedMetadataCapacity(1, 1, 2),
+        )
+        entered_creation = threading.Event()
+        creation_result = []
+
+        def profile_creation(frame, event, arg):
+            if event == "c_call" and getattr(arg, "__name__", "") == "create_or_attach":
+                entered_creation.set()
+
+        def create_metadata():
+            sys.setprofile(profile_creation)
+            try:
+                creation_result.append(
+                    ("ok", SharedMetadata.create_or_attach(name, creation_config))
+                )
+            except BaseException as error:
+                creation_result.append(("error", repr(error)))
+            finally:
+                sys.setprofile(None)
+
+        creation_worker = threading.Thread(target=create_metadata)
+        creation_worker.start()
+        if not entered_creation.wait(5):
+            raise AssertionError("creation worker did not enter the binding")
+        creation_config.pools = []
+        creation_worker.join(30)
+        if creation_worker.is_alive():
+            raise AssertionError("creation worker deadlocked")
+        if not creation_result or creation_result[0][0] != "ok":
+            raise AssertionError(f"metadata creation failed: {creation_result}")
+        metadata = creation_result[0][1]
+        created_pool = metadata.find_pool(original_pool_name)
+        if created_pool is None:
+            raise AssertionError(
+                "creation did not use the entry configuration snapshot"
+            )
+        if not metadata.retire_pool(created_pool.pool_ref):
+            raise AssertionError(
+                "created pool could not be retired for registration test"
+            )
+
+        config = SharedDataPoolConfig(
+            original_pool_name,
+            SharedPoolKind.HOST,
+            1,
+            128,
+            CompatibilityDescriptor(1, [1]),
+        )
+        entered_call = threading.Event()
+        registration_result = []
+
+        def profile_call(frame, event, arg):
+            if (
+                event == "c_call"
+                and getattr(arg, "__name__", "") == "register_or_attach_pool"
+            ):
+                entered_call.set()
+
+        def register_pool():
+            sys.setprofile(profile_call)
+            try:
+                registration_result.append(
+                    ("ok", metadata.register_or_attach_pool(config).name)
+                )
+            except BaseException as error:
+                registration_result.append(("error", repr(error)))
+            finally:
+                sys.setprofile(None)
+
+        worker = threading.Thread(target=register_pool)
+        worker.start()
+        if not entered_call.wait(5):
+            raise AssertionError("registration worker did not enter the binding")
+        config.name = mutated_pool_name
+        worker.join(30)
+        result_queue.put(
+            (
+                "ok",
+                creation_worker.is_alive(),
+                worker.is_alive(),
+                registration_result,
+                metadata.find_pool(original_pool_name) is not None,
+                metadata.find_pool(mutated_pool_name) is not None,
+            )
+        )
+    except BaseException as error:
+        result_queue.put(("error", repr(error)))
+    finally:
+        metadata = None
+        SharedMetadata.unlink_by_name(name)
+
+
+def test_mutable_config_is_snapshotted_before_gil_release():
+    if torch.spyre.is_initialized():
+        pytest.skip("requires a fresh process so the child can open the card")
+
+    name = f"test_mutable_config_is_snapshotted_before_gil_release.{os.getpid()}"
+    SharedMetadata.unlink_by_name(name)
+    context = multiprocessing.get_context("spawn")
+    result_queue = context.Queue()
+    process = context.Process(
+        target=_run_config_snapshot_test,
+        args=(name, result_queue),
+    )
+    try:
+        process.start()
+        process.join(60)
+        if process.is_alive():
+            pytest.fail("child deadlocked during pool registration")
+        assert process.exitcode == 0
+        try:
+            result = result_queue.get(timeout=2)
+        except Empty as error:
+            pytest.fail(f"child returned no config snapshot result: {error}")
+
+        assert result[0] == "ok", result
+        (
+            _,
+            creation_worker_alive,
+            worker_alive,
+            registration_result,
+            found_original,
+            found_mutated,
+        ) = result
+        assert not creation_worker_alive
+        assert not worker_alive
+        assert registration_result == [("ok", f"{name}.pool-a")]
+        assert found_original
+        assert not found_mutated
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(5)
+        result_queue.close()
+        result_queue.join_thread()
+        SharedMetadata.unlink_by_name(name)
 
 
 class TestSharedMetadata(TestCase):
@@ -294,16 +448,15 @@ class TestSharedMetadata(TestCase):
 
     def test_stale_entry_cannot_pin_or_evict_reused_slot(self):
         md, registered = self.create_metadata(slots=1)
-        old_key = CompatibleBlockKey(registered.compatibility, 0x2501)
-        old_reservation = md.claim(registered.pool_ref, old_key)
+        key = CompatibleBlockKey(registered.compatibility, 0x2501)
+        old_reservation = md.claim(registered.pool_ref, key)
         self.assertIsInstance(old_reservation, Reservation)
         md.publish(old_reservation, [ChunkDescriptorEntry(0, 128)])
-        old_entry = md.lookup(old_key)
+        old_entry = md.lookup(key)
         self.assertIsNotNone(old_entry)
         self.assertTrue(md.evict(old_entry))
 
-        new_key = CompatibleBlockKey(registered.compatibility, 0x2502)
-        new_reservation = md.claim(registered.pool_ref, new_key)
+        new_reservation = md.claim(registered.pool_ref, key)
         self.assertIsInstance(new_reservation, Reservation)
         self.assertEqual(new_reservation.slot.slot_id, old_entry.slot.slot_id)
         self.assertNotEqual(
@@ -313,11 +466,87 @@ class TestSharedMetadata(TestCase):
 
         self.assertIsNone(md.pin_read(old_entry))
         self.assertFalse(md.evict(old_entry))
-        new_entry = md.lookup(new_key)
+        new_entry = md.lookup(key)
         self.assertIsNotNone(new_entry)
         pin = md.pin_read(new_entry)
         self.assertIsInstance(pin, SlotReadPin)
         del pin
+
+    def test_stale_pool_row_references_cannot_access_replacement(self):
+        name = f"{self.id()}.{os.getpid()}"
+        SharedMetadata.unlink_by_name(name)
+        self.addCleanup(SharedMetadata.unlink_by_name, name)
+        metadata = SharedMetadata.create_or_attach(
+            name,
+            SharedMetadataConfig(1, [], SharedMetadataCapacity(1, 1, 1)),
+        )
+        config = SharedDataPoolConfig(
+            f"{name}.pool",
+            SharedPoolKind.HOST,
+            1,
+            128,
+            CompatibilityDescriptor(1, [1]),
+        )
+        original = metadata.register_or_attach_pool(config)
+        old_key = CompatibleBlockKey(original.compatibility, 0x2511)
+        reservation = metadata.claim(original.pool_ref, old_key)
+        self.assertIsInstance(reservation, Reservation)
+        metadata.publish(reservation, [ChunkDescriptorEntry(0, 128)])
+        old_entry = metadata.lookup(old_key)
+        self.assertIsNotNone(old_entry)
+
+        self.assertTrue(metadata.retire_pool(original.pool_ref))
+        replacement = metadata.register_or_attach_pool(config)
+        self.assertEqual(replacement.pool_ref.pool_id, original.pool_ref.pool_id)
+        self.assertNotEqual(
+            replacement.pool_ref.pool_version,
+            original.pool_ref.pool_version,
+        )
+
+        fresh_key = CompatibleBlockKey(replacement.compatibility, 0x2512)
+        self.assertIsNone(metadata.resolve_pool(original.pool_ref))
+        self.assertIsNone(metadata.pin_read(old_entry))
+        self.assertFalse(metadata.evict(old_entry))
+        self.assertIsInstance(metadata.claim(original.pool_ref, fresh_key), Unavailable)
+        fresh_reservation = metadata.claim(replacement.pool_ref, fresh_key)
+        self.assertIsInstance(fresh_reservation, Reservation)
+        metadata.abort(fresh_reservation)
+
+    def test_stale_metadata_references_cannot_access_recreated_directory(self):
+        name = f"{self.id()}.{os.getpid()}"
+        SharedMetadata.unlink_by_name(name)
+        self.addCleanup(SharedMetadata.unlink_by_name, name)
+        config = self.make_config(name, slots=1)
+        old_metadata = SharedMetadata.create_or_attach(name, config)
+        old_registered = old_metadata.find_pool(f"{name}.pool")
+        self.assertIsNotNone(old_registered)
+        old_key = CompatibleBlockKey(old_registered.compatibility, 0x2521)
+        old_reservation = old_metadata.claim(old_registered.pool_ref, old_key)
+        self.assertIsInstance(old_reservation, Reservation)
+        old_metadata.publish(old_reservation, [ChunkDescriptorEntry(0, 128)])
+        old_entry = old_metadata.lookup(old_key)
+        self.assertIsNotNone(old_entry)
+        old_version = old_metadata.version()
+
+        del old_reservation
+        SharedMetadata.unlink_by_name(name)
+        del old_metadata
+        metadata = SharedMetadata.create_or_attach(name, config)
+        registered = metadata.find_pool(f"{name}.pool")
+        self.assertIsNotNone(registered)
+        self.assertNotEqual(metadata.version(), old_version)
+
+        fresh_key = CompatibleBlockKey(registered.compatibility, 0x2521)
+        self.assertIsNone(metadata.lookup(old_key))
+        self.assertIsNone(metadata.resolve_pool(old_registered.pool_ref))
+        self.assertIsNone(metadata.pin_read(old_entry))
+        self.assertFalse(metadata.evict(old_entry))
+        self.assertIsInstance(
+            metadata.claim(old_registered.pool_ref, fresh_key), Unavailable
+        )
+        fresh_reservation = metadata.claim(registered.pool_ref, fresh_key)
+        self.assertIsInstance(fresh_reservation, Reservation)
+        metadata.abort(fresh_reservation)
 
     def test_protocol_objects_do_not_expose_raw_addresses(self):
         md, registered = self.create_metadata(slots=1)

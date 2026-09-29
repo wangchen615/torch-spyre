@@ -14,6 +14,8 @@ Every process uses the same metadata name and configuration. The first process
 creates the directory and pools; later processes attach them.
 
 ```python
+import torch
+
 from torch_spyre import _C
 
 compatibility = _C.CompatibilityDescriptor(1, [1, 2, 3])
@@ -100,6 +102,14 @@ if entry is not None:
 An eviction waits for outstanding read pins before recycling the slot. Calls
 that may wait on a process-shared lock or DMA release the Python GIL, so an
 unrelated Python thread can continue running.
+
+## Pool retirement
+
+Call `retire_pool(pool_ref)` only after establishing host-wide DMA quiescence
+for that pool. Unlike eviction, retirement does not wait for read pins to drain
+and does not synchronize outstanding DMA. Callers must prevent every process
+from starting another transfer and wait for all submitted transfers to finish
+before retiring the pool.
 
 ## Versions and lifetime
 
