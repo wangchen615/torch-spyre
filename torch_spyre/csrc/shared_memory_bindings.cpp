@@ -28,6 +28,7 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "module.h"
@@ -106,6 +107,44 @@ void init_shared_memory_bindings(py::module_& m) {
       .def_readonly("slot_count", &flex::RegisteredPool::slot_count)
       .def_readonly("slot_bytes", &flex::RegisteredPool::slot_bytes);
 
+  py::class_<flex::CompatibleBlockKey>(m, "CompatibleBlockKey")
+      .def(py::init(
+          [](flex::CompatibilityRef compatibility, flex::BlockHash block_hash) {
+            return flex::CompatibleBlockKey{compatibility, block_hash};
+          }))
+      .def_readonly("compatibility", &flex::CompatibleBlockKey::compatibility)
+      .def_readonly("block_hash", &flex::CompatibleBlockKey::block_hash);
+
+  py::class_<flex::SlotRef>(m, "SlotRef")
+      .def_readonly("pool", &flex::SlotRef::pool)
+      .def_readonly("slot_id", &flex::SlotRef::slot_id)
+      .def_readonly("slot_version", &flex::SlotRef::slot_version);
+
+  py::class_<flex::ChunkDescriptorEntry>(m, "ChunkDescriptorEntry")
+      .def(py::init([](uint32_t domain_id, uint64_t size) {
+        return flex::ChunkDescriptorEntry{domain_id, size};
+      }))
+      .def_readonly("domain_id", &flex::ChunkDescriptorEntry::domain_id)
+      .def_readonly("size", &flex::ChunkDescriptorEntry::size);
+
+  py::class_<flex::LookupEntry>(m, "LookupEntry")
+      .def_readonly("key", &flex::LookupEntry::key)
+      .def_readonly("slot", &flex::LookupEntry::slot)
+      .def_readonly("chunks", &flex::LookupEntry::chunks);
+
+  py::class_<flex::Reservation>(m, "Reservation")
+      .def_property_readonly("key", &flex::Reservation::Key,
+                             py::return_value_policy::reference_internal)
+      .def_property_readonly("slot", &flex::Reservation::Slot,
+                             py::return_value_policy::reference_internal);
+
+  py::class_<flex::ExistingClaim>(m, "ExistingClaim")
+      .def_readonly("slot", &flex::ExistingClaim::slot)
+      .def_readonly("valid", &flex::ExistingClaim::valid);
+
+  py::class_<flex::NoSpace>(m, "NoSpace");
+  py::class_<flex::Unavailable>(m, "Unavailable");
+
   py::class_<flex::SharedPool, std::shared_ptr<flex::SharedPool>>(m,
                                                                   "SharedPool")
       .def("name", &flex::SharedPool::Name);
@@ -165,7 +204,35 @@ void init_shared_memory_bindings(py::module_& m) {
           },
           py::arg("pool_ref"))
       .def("retire_pool", &flex::SharedMetadata::RetirePool,
-           py::arg("pool_ref"), py::call_guard<py::gil_scoped_release>());
+           py::arg("pool_ref"), py::call_guard<py::gil_scoped_release>())
+      .def("lookup", &flex::SharedMetadata::Lookup, py::arg("key"),
+           py::call_guard<py::gil_scoped_release>())
+      .def(
+          "claim",
+          [](flex::SharedMetadata& metadata, const flex::PoolRef& target_pool,
+             const flex::CompatibleBlockKey& key) {
+            auto result = [&]() {
+              py::gil_scoped_release release;
+              return metadata.Claim(target_pool, key);
+            }();
+            return std::visit(
+                [](auto&& value) -> py::object {
+                  return py::cast(std::forward<decltype(value)>(value));
+                },
+                std::move(result));
+          },
+          py::arg("target_pool"), py::arg("key"), py::keep_alive<0, 1>(),
+          "Reserve a slot for a key. The caller must publish or abort every "
+          "returned Reservation.")
+      .def("publish", &flex::SharedMetadata::Publish, py::arg("reservation"),
+           py::arg("chunks"), py::call_guard<py::gil_scoped_release>(),
+           "Publish a reservation only after its D2H DMA has synchronized.")
+      .def("abort", &flex::SharedMetadata::Abort, py::arg("reservation"),
+           py::call_guard<py::gil_scoped_release>(),
+           "Abort only before DMA submission or after submitted DMA is "
+           "quiescent.")
+      .def("evict", &flex::SharedMetadata::Evict, py::arg("entry"),
+           py::call_guard<py::gil_scoped_release>());
 }
 
 }  // namespace torch_spyre::shared_memory
