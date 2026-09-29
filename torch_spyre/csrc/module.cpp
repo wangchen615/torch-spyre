@@ -29,7 +29,6 @@
 #include <cstdlib>     // std::getenv
 #include <filesystem>  // NOLINT(build/c++17)
 #include <flex/flex.hpp>
-#include <flex/memory_interface/shared_host_pool.hpp>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -50,6 +49,7 @@
 #include "logging_config.h"
 #include "perm_layout_native.h"
 #include "prepare_kernel.h"
+#include "shared_memory_bindings.h"
 #include "spyre_allocator.h"
 #include "spyre_composite_address.h"
 #include "spyre_device_enum.h"
@@ -274,6 +274,8 @@ PYBIND11_MODULE(_C, m) {
   // Initialize logging bindings
   torch_spyre::logging::init_logging_bindings(m);
 
+  torch_spyre::shared_memory::init_shared_memory_bindings(m);
+
   // Register the native scratchpad layout packer accelerator.
   torch_spyre::scratchpad::register_perm_layout_native(m);
 
@@ -286,24 +288,6 @@ PYBIND11_MODULE(_C, m) {
       .value("QFP8WT", spyre::ElementArrangement::QFP8WT);
 
   py::class_<spyre::SpyreTensorLayout> dci_cls(m, "SpyreTensorLayout");
-
-  py::class_<flex::SharedPool>(m, "SharedPool")
-      .def("slot_count", &flex::SharedPool::SlotCount)
-      .def("slot_bytes", &flex::SharedPool::SlotBytes)
-      .def("name", &flex::SharedPool::Name)
-      .def("total_bytes", &flex::SharedPool::TotalBytes);
-
-  py::class_<flex::SharedHostPool, flex::SharedPool>(m, "SharedHostPool")
-      .def_static(
-          "create_or_attach",
-          [](const std::string& name, size_t num_slots, size_t slot_bytes) {
-            spyre::startRuntime();
-            return flex::SharedHostPool::CreateOrAttach(
-                spyre::GlobalRuntime::get(), name, num_slots, slot_bytes);
-          },
-          py::arg("name"), py::arg("num_slots"), py::arg("slot_bytes"))
-      .def_static("unlink_by_name", &flex::SharedHostPool::UnlinkByName,
-                  py::arg("name"));
 
   dci_cls.def_readonly("device_size", &spyre::SpyreTensorLayout::device_size)
       .def_readonly("stride_map", &spyre::SpyreTensorLayout::stride_map)

@@ -22,6 +22,7 @@ from torch.testing._internal.common_utils import (
 from transformers import AutoConfig
 
 from torch_spyre._C import (  # type: ignore[attr-defined]
+    SharedDataPool,
     SharedHostPool,
     get_composite_address,
 )
@@ -51,6 +52,13 @@ class TestSharedHostPool(TestCase):
         # Check if greater than or equal because the actual slot bytes may be
         # larger due to alignment of size/stride of the pool
         self.assertGreaterEqual(shared_pool.slot_bytes(), 5)
+
+    def test_shared_data_pool_hierarchy(self):
+        pool = SharedHostPool.create_or_attach(self.id(), 2, 128)
+        self.assertIsInstance(pool, SharedDataPool)
+        self.assertEqual(pool.name(), self.id())
+        self.assertEqual(pool.slot_count(), 2)
+        self.assertGreaterEqual(pool.slot_bytes(), 128)
 
     def test_attach_existing_pool(self):
         # Create a shared pool and assign to _ to keep it alive

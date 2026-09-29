@@ -928,12 +928,13 @@ at::Tensor& spyre_set_storage(at::Tensor& result, at::Storage storage,
 
 namespace {
 
-// ---- KV-page range derivation -------------------------------------------------
+// ---- KV-page range derivation
+// -------------------------------------------------
 //
-// A production decoder KV cache is allocated by spyre-inference with an explicit
-// SpyreTensorLayout (slot_major_kv_layout / head_major_kv_layout) that folds the
-// page index into device dimension 0. One page is then a single contiguous
-// physical interval at block_id * page_bytes.
+// A production decoder KV cache is allocated by spyre-inference with an
+// explicit SpyreTensorLayout (slot_major_kv_layout / head_major_kv_layout) that
+// folds the page index into device dimension 0. One page is then a single
+// contiguous physical interval at block_id * page_bytes.
 //
 // This must be derived from the DEVICE image, never from storage_offset() and
 // numel(): those describe the host view. They happen to agree when
@@ -958,8 +959,9 @@ struct KvPageRange {
 // Validate the KV-page contract and return the one physical page interval.
 // Throws (before any DMA is enqueued) if the tensor is not a recognized
 // production KV cache.
-KvPageRange derive_kv_page_range(const at::Tensor& cache, size_t block_id,
-                                 const flex::CompositeAddress* composite_address) {
+KvPageRange derive_kv_page_range(
+    const at::Tensor& cache, size_t block_id,
+    const flex::CompositeAddress* composite_address) {
   // (1) On Spyre, with device layout metadata.
   TORCH_CHECK(cache.is_privateuseone(),
               "copy_kv_page_raw: cache must be a Spyre tensor, got device ",
@@ -969,13 +971,15 @@ KvPageRange derive_kv_page_range(const at::Tensor& cache, size_t block_id,
   const auto& sm = stl.stride_map;
 
   // (2) Rank-4 logical [N, X, Y, D] and rank-4 device image.
-  TORCH_CHECK(cache.dim() == 4,
-              "copy_kv_page_raw: expected a rank-4 KV cache [N,X,Y,D], got rank ",
-              cache.dim());
-  TORCH_CHECK(ds.size() == 4,
-              "copy_kv_page_raw: expected a rank-4 device layout, got rank ",
-              ds.size(), ". A generic tiled layout (rank 5) is not a supported "
-              "KV cache; allocate via the spyre-inference allocate_pages path.");
+  TORCH_CHECK(
+      cache.dim() == 4,
+      "copy_kv_page_raw: expected a rank-4 KV cache [N,X,Y,D], got rank ",
+      cache.dim());
+  TORCH_CHECK(
+      ds.size() == 4,
+      "copy_kv_page_raw: expected a rank-4 device layout, got rank ", ds.size(),
+      ". A generic tiled layout (rank 5) is not a supported "
+      "KV cache; allocate via the spyre-inference allocate_pages path.");
 
   const int64_t num_blocks = cache.size(0);
   const int64_t head_size = cache.size(3);
@@ -984,8 +988,7 @@ KvPageRange derive_kv_page_range(const at::Tensor& cache, size_t block_id,
   // (3) Head size must fill whole sticks, or the device image is padded and no
   // single host-derived range can describe it.
   TORCH_CHECK(eps > 0, "copy_kv_page_raw: invalid stick width ", eps);
-  TORCH_CHECK(head_size % eps == 0,
-              "copy_kv_page_raw: head_size ", head_size,
+  TORCH_CHECK(head_size % eps == 0, "copy_kv_page_raw: head_size ", head_size,
               " is not a multiple of the stick width ", eps,
               "; the device image is padded and one byte range cannot describe "
               "a page");
@@ -1010,23 +1013,24 @@ KvPageRange derive_kv_page_range(const at::Tensor& cache, size_t block_id,
   // would come out an integer multiple too large. Requiring
   // num_blocks * inner == ds[0] pins num_blocks to the real page count.
   TORCH_CHECK(num_blocks > 0,
-              "copy_kv_page_raw: cache has no pages (size(0) = ", num_blocks, ")");
+              "copy_kv_page_raw: cache has no pages (size(0) = ", num_blocks,
+              ")");
   const int64_t inner = ds[0] / num_blocks;
-  TORCH_CHECK(num_blocks * inner == ds[0] &&
-                  (inner == cache.size(1) || inner == cache.size(2)),
-              "copy_kv_page_raw: device dim 0 (", ds[0],
-              ") is not num_blocks (", num_blocks,
-              ") times the per-page inner extent (got ", inner,
-              ", expected size(1)=", cache.size(1), " or size(2)=",
-              cache.size(2),
-              "). Either the page index is not folded into device dimension 0, "
-              "or this is a view over part of a cache rather than a whole "
-              "cache; pass the full cache and a block_id.");
+  TORCH_CHECK(
+      num_blocks * inner == ds[0] &&
+          (inner == cache.size(1) || inner == cache.size(2)),
+      "copy_kv_page_raw: device dim 0 (", ds[0], ") is not num_blocks (",
+      num_blocks, ") times the per-page inner extent (got ", inner,
+      ", expected size(1)=", cache.size(1), " or size(2)=", cache.size(2),
+      "). Either the page index is not folded into device dimension 0, "
+      "or this is a view over part of a cache rather than a whole "
+      "cache; pass the full cache and a block_id.");
 
   // (5) The tensor must be the full cache, not an arbitrary slice of one.
   TORCH_CHECK(cache.storage_offset() == 0,
               "copy_kv_page_raw: expected the full cache allocation "
-              "(storage_offset 0), got ", cache.storage_offset(),
+              "(storage_offset 0), got ",
+              cache.storage_offset(),
               ". Pass the cache and a block_id, not a page view.");
   TORCH_CHECK(cache.is_contiguous(),
               "copy_kv_page_raw: expected a contiguous logical cache tensor");
@@ -1057,9 +1061,9 @@ KvPageRange derive_kv_page_range(const at::Tensor& cache, size_t block_id,
               offset + page_bytes, ") exceeds the allocation (", alloc_bytes,
               " B)");
 
-  SPYRE_RUNTIME_DEBUG() << "copy_kv_page_raw: block " << block_id << " -> Range("
-                        << offset << ", " << page_bytes << ") of " << alloc_bytes
-                        << " B";
+  SPYRE_RUNTIME_DEBUG() << "copy_kv_page_raw: block " << block_id
+                        << " -> Range(" << offset << ", " << page_bytes
+                        << ") of " << alloc_bytes << " B";
   return KvPageRange{static_cast<size_t>(offset),
                      static_cast<size_t>(page_bytes)};
 }
@@ -1067,7 +1071,7 @@ KvPageRange derive_kv_page_range(const at::Tensor& cache, size_t block_id,
 }  // namespace
 
 void copy_kv_page_raw(const at::Tensor& cache, size_t block_id,
-                      const flex::SharedPool& pool, size_t slot_id,
+                      const flex::SharedDataPool& pool, size_t slot_id,
                       bool to_device, bool non_blocking) {
   SpyreStream stream = getCurrentStream(cache.device());
 
@@ -1087,8 +1091,9 @@ void copy_kv_page_raw(const at::Tensor& cache, size_t block_id,
   }
 }
 
-void copy_tensor_raw(const at::Tensor& dev_tensor, const flex::SharedPool& pool,
-                     size_t slot_id, bool to_device, bool non_blocking) {
+void copy_tensor_raw(const at::Tensor& dev_tensor,
+                     const flex::SharedDataPool& pool, size_t slot_id,
+                     bool to_device, bool non_blocking) {
   c10::Device device = dev_tensor.device();
   SpyreStream stream = getCurrentStream(device);
 
