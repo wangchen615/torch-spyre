@@ -330,5 +330,6 @@ and default stream. It does not own a separate runtime context.
 ```{toctree}
 :maxdepth: 1
 
+shared_metadata
 memory_pressure_gc
 ```

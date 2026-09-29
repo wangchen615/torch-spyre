@@ -17,9 +17,10 @@ import os
 import multiprocessing
 import threading
 import time
-import unittest
 from queue import Empty
 
+import pytest
+import torch
 from torch.testing._internal.common_utils import TestCase, run_tests
 
 from torch_spyre._C import (  # type: ignore[attr-defined]
@@ -92,46 +93,49 @@ def _run_gil_progress_test(name, ready, result_queue):
         ready.set()
 
 
-class TestSharedMetadataGIL(unittest.TestCase):
-    def test_blocked_evict_releases_gil(self):
-        name = f"{self.id()}.{os.getpid()}"
-        pool_name = f"{name}.pool"
-        SharedMetadata.unlink_by_name(name)
-        SharedHostPool.unlink_by_name(pool_name)
-        self.addCleanup(SharedMetadata.unlink_by_name, name)
-        self.addCleanup(SharedHostPool.unlink_by_name, pool_name)
+def test_blocked_evict_releases_gil():
+    if torch.spyre.is_initialized():
+        pytest.skip("requires a fresh process so the child can open the same card")
 
-        context = multiprocessing.get_context("spawn")
-        ready = context.Event()
-        result_queue = context.Queue()
-        process = context.Process(
-            target=_run_gil_progress_test, args=(name, ready, result_queue)
-        )
+    name = f"test_blocked_evict_releases_gil.{os.getpid()}"
+    pool_name = f"{name}.pool"
+    SharedMetadata.unlink_by_name(name)
+    SharedHostPool.unlink_by_name(pool_name)
+
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    result_queue = context.Queue()
+    process = context.Process(
+        target=_run_gil_progress_test,
+        args=(name, ready, result_queue),
+    )
+    try:
         process.start()
         if not ready.wait(60):
-            process.terminate()
-            process.join(5)
-            self.fail("child did not finish shared-metadata setup")
+            pytest.fail("child did not finish shared-metadata setup")
         process.join(10)
         if process.is_alive():
-            process.terminate()
-            process.join(5)
-            self.fail("child deadlocked while eviction waited for a read pin")
-        self.assertEqual(process.exitcode, 0)
+            pytest.fail("child deadlocked while eviction waited for a read pin")
+        assert process.exitcode == 0
         try:
             result = result_queue.get(timeout=2)
         except Empty as error:
-            self.fail(f"child returned no GIL progress result: {error}")
-        finally:
-            result_queue.close()
-            result_queue.join_thread()
+            pytest.fail(f"child returned no GIL progress result: {error}")
 
-        self.assertEqual(result[0], "ok", result)
+        assert result[0] == "ok", result
         _, blocked_before_release, progress, worker_alive, evicted = result
-        self.assertTrue(blocked_before_release)
-        self.assertEqual(progress, ["main-thread-ran"])
-        self.assertFalse(worker_alive)
-        self.assertEqual(evicted, [True])
+        assert blocked_before_release
+        assert progress == ["main-thread-ran"]
+        assert not worker_alive
+        assert evicted == [True]
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(5)
+        result_queue.close()
+        result_queue.join_thread()
+        SharedMetadata.unlink_by_name(name)
+        SharedHostPool.unlink_by_name(pool_name)
 
 
 class TestSharedMetadata(TestCase):
@@ -313,6 +317,25 @@ class TestSharedMetadata(TestCase):
         self.assertIsNotNone(new_entry)
         pin = md.pin_read(new_entry)
         self.assertIsInstance(pin, SlotReadPin)
+        del pin
+
+    def test_protocol_objects_do_not_expose_raw_addresses(self):
+        md, registered = self.create_metadata(slots=1)
+        pool = md.resolve_pool(registered.pool_ref)
+        key = CompatibleBlockKey(registered.compatibility, 0x2601)
+        reservation = md.claim(registered.pool_ref, key)
+        self.assertIsInstance(reservation, Reservation)
+        md.publish(reservation, [ChunkDescriptorEntry(0, 128)])
+        entry = md.lookup(key)
+        self.assertIsNotNone(entry)
+        pin = md.pin_read(entry)
+        self.assertIsNotNone(pin)
+
+        for value in (md, pool, reservation, entry, pin):
+            self.assertFalse(hasattr(value, "slot_ptr"))
+            self.assertFalse(hasattr(value, "host_address"))
+            self.assertFalse(hasattr(value, "device_address"))
+
         del pin
 
 

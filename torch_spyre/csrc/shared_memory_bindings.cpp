@@ -145,7 +145,10 @@ void init_shared_memory_bindings(py::module_& m) {
   py::class_<flex::NoSpace>(m, "NoSpace");
   py::class_<flex::Unavailable>(m, "Unavailable");
 
-  py::class_<flex::SlotReadPin>(m, "SlotReadPin");
+  py::class_<flex::SlotReadPin>(
+      m, "SlotReadPin",
+      "Pins one slot version through blocking H2D completion. Destroy the "
+      "pin on the thread that acquired it.");
 
   py::class_<flex::SharedPool, std::shared_ptr<flex::SharedPool>>(m,
                                                                   "SharedPool")
@@ -173,7 +176,17 @@ void init_shared_memory_bindings(py::module_& m) {
                   py::arg("name"), py::call_guard<py::gil_scoped_release>());
 
   py::class_<flex::SharedMetadata, flex::SharedPool,
-             std::shared_ptr<flex::SharedMetadata>>(m, "SharedMetadata")
+             std::shared_ptr<flex::SharedMetadata>>(
+      m, "SharedMetadata",
+      "Thin binding for Flex's process-shared metadata directory.\n\n"
+      "Write protocol: claim -> blocking D2H copy -> publish. Read protocol: "
+      "lookup -> pin_read -> blocking H2D copy -> destroy the pin on the "
+      "acquiring thread. An unpublished reservation is a miss. Abort only "
+      "before DMA submission or after submitted DMA is quiescent. A slot "
+      "version is a wrapping 64-bit tenancy detector, not a lifetime-unique "
+      "ID. No binding holds the directory lock across DMA. No raw pointer or "
+      "address is exposed. NoSpace requires caller-selected eviction and "
+      "retry.")
       .def_static(
           "create_or_attach",
           [](const std::string& name,
