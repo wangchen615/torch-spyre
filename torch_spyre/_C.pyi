@@ -17,6 +17,9 @@ __all__: list[str] = [
     "SpyreTensorLayout",
     "SymbolicArg",
     "SymbolicArgKind",
+    "SharedPool",
+    "SharedHostPool",
+    "SharedMarvellPool",
     "_SpyreStreamBase",
     "current_stream",
     "default_stream",
@@ -29,6 +32,8 @@ __all__: list[str] = [
     "as_strided_with_layout",
     "empty_with_layout",
     "copy_tensor",
+    "copy_tensor_raw",
+    "copy_kv_page_raw",
     "fill_tensor",
     "encode_constant",
     "extract_kernel_provenance_key",
@@ -220,6 +225,46 @@ class SpyreTensorLayout:
     @property
     def stride_map(self) -> list[int]: ...
 
+class SharedPool:
+    """Fixed-size, index-addressed slots shared across processes by name."""
+
+    def slot_count(self) -> int: ...
+    def slot_bytes(self) -> int: ...
+    def name(self) -> str: ...
+    def total_bytes(self) -> int: ...
+
+class SharedHostPool(SharedPool):
+    """SharedPool whose slots live in host POSIX shared memory."""
+
+    @staticmethod
+    def create_or_attach(
+        name: str, num_slots: typing.SupportsInt, slot_bytes: typing.SupportsInt
+    ) -> SharedHostPool: ...
+    @staticmethod
+    def unlink_by_name(name: str) -> None: ...
+
+class SharedMarvellPool(SharedPool):
+    """SharedPool whose slots live in a Marvell card's PCI BAR2 window.
+
+    Copies are peer-to-peer between Spyre HBM and the card. Overlapping BAR2
+    windows of pools under different names are not detected.
+    """
+
+    @staticmethod
+    def create_or_attach(
+        name: str,
+        pci_bdf: str,
+        num_slots: typing.SupportsInt,
+        slot_bytes: typing.SupportsInt,
+        bar_offset: typing.SupportsInt = 0,
+    ) -> SharedMarvellPool: ...
+    @staticmethod
+    def unlink_by_name(name: str) -> None: ...
+    @property
+    def bus_address(self) -> int:
+        """PCI bus address of slot 0 (BAR2 base + bar_offset)."""
+        ...
+
 class _SpyreStreamBase:
     """
     C++ SpyreStream wrapper class.
@@ -319,6 +364,27 @@ def copy_tensor(
     Args:
         self or dst: one of that must be on spyre device
     """
+    ...
+
+def copy_tensor_raw(
+    dev_tensor: torch.Tensor,
+    pool: SharedPool,
+    slot_id: typing.SupportsInt,
+    to_device: bool,
+    non_blocking: bool = False,
+) -> None:
+    """Copy a device tensor's bytes to or from one pool slot."""
+    ...
+
+def copy_kv_page_raw(
+    cache: torch.Tensor,
+    block_id: typing.SupportsInt,
+    pool: SharedPool,
+    slot_id: typing.SupportsInt,
+    to_device: bool,
+    non_blocking: bool = False,
+) -> None:
+    """Copy one validated KV cache page to or from one pool slot."""
     ...
 
 def fill_tensor(self: torch.Tensor, value: float) -> torch.Tensor:

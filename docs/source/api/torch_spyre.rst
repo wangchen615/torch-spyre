@@ -590,6 +590,80 @@ manipulation of device tensor layouts. See
    :param torch.Tensor tensor: A Spyre device tensor.
    :param SpyreTensorLayout layout: The layout to assign.
 
+KV Offload Pools
+----------------
+
+A shared pool is a set of fixed-size, index-addressed slots, shared across
+processes by name, that a KV cache page can be copied to and from without
+going through a host tensor. Two kinds exist; both are accepted wherever a
+``SharedPool`` is.
+
+.. class:: torch_spyre._C.SharedPool
+
+   Base class of the pool kinds below.
+
+   .. method:: slot_count() -> int
+   .. method:: slot_bytes() -> int
+
+      The slot stride in use, the requested size rounded up to 128 bytes.
+
+   .. method:: total_bytes() -> int
+   .. method:: name() -> str
+
+.. class:: torch_spyre._C.SharedHostPool
+
+   Slots in host POSIX shared memory.
+
+   .. staticmethod:: create_or_attach(name, num_slots, slot_bytes) -> SharedHostPool
+
+      Create the pool, or attach to one another process created under
+      ``name``. Attaching with a different geometry raises ``RuntimeError``.
+
+   .. staticmethod:: unlink_by_name(name)
+
+      Best-effort removal of a pool by name, for cleanup after a crashed owner.
+
+.. class:: torch_spyre._C.SharedMarvellPool
+
+   Slots in the PCI BAR2 window of a Marvell card. Copies go peer-to-peer
+   between Spyre HBM and the card and never touch host DRAM; the Spyre card
+   and the Marvell card must share a PCIe switch with ACS redirection
+   disabled. Only a small ``<name>.ctl`` control segment is in host shared
+   memory.
+
+   .. staticmethod:: create_or_attach(name, pci_bdf, num_slots, slot_bytes, bar_offset=0) -> SharedMarvellPool
+
+      Create or attach to the pool over
+      ``[bar_offset, bar_offset + num_slots * slot_bytes)`` of the BAR2 of
+      ``pci_bdf`` (e.g. ``"0000:83:00.0"``). ``bar_offset`` must be 128-byte
+      aligned and the window must fit in BAR2 (``ValueError`` otherwise).
+      Windows of pools under different names are **not** checked for
+      overlap: callers that create several pools must give them disjoint
+      ``bar_offset`` values.
+
+   .. staticmethod:: unlink_by_name(name)
+
+      Best-effort removal of the control segment by name. The bytes on the
+      card are unaffected.
+
+   .. attribute:: bus_address
+
+      Read-only PCI bus address of slot 0 (BAR2 base + ``bar_offset``).
+
+.. function:: torch_spyre._C.copy_kv_page_raw(cache, block_id, pool, slot_id, to_device, non_blocking=False)
+
+   Copy page ``block_id`` of a KV cache to (``to_device=False``) or from
+   (``to_device=True``) slot ``slot_id`` of ``pool``. ``cache`` must be the
+   whole rank-4 cache allocated with a token-major or head-major KV layout;
+   the page's physical byte range is derived from its device layout, and any
+   other tensor is rejected before a DMA is issued.
+
+.. function:: torch_spyre._C.copy_tensor_raw(dev_tensor, pool, slot_id, to_device, non_blocking=False)
+
+   Copy a device tensor's bytes to or from one pool slot. The byte range is
+   taken from the tensor's logical offset and size and must be 128-byte
+   aligned; prefer ``copy_kv_page_raw`` for KV pages.
+
 Warnings
 --------
 

@@ -30,6 +30,7 @@
 #include <filesystem>  // NOLINT(build/c++17)
 #include <flex/flex.hpp>
 #include <flex/memory_interface/shared_host_pool.hpp>
+#include <flex/memory_interface/shared_marvell_pool.hpp>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -304,6 +305,29 @@ PYBIND11_MODULE(_C, m) {
           py::arg("name"), py::arg("num_slots"), py::arg("slot_bytes"))
       .def_static("unlink_by_name", &flex::SharedHostPool::UnlinkByName,
                   py::arg("name"));
+
+  // Pool whose slots live in a Marvell card's PCI BAR2 window; copies are
+  // peer-to-peer between Spyre HBM and the card. Windows of two pools under
+  // different names are NOT checked for overlap: callers that create more than
+  // one pool must assign disjoint bar_offsets themselves.
+  py::class_<flex::SharedMarvellPool, flex::SharedPool>(m, "SharedMarvellPool")
+      .def_static(
+          "create_or_attach",
+          [](const std::string& name, const std::string& pci_bdf,
+             size_t num_slots, size_t slot_bytes, uint64_t bar_offset) {
+            // The factory takes no RuntimeContext, but copies on the pool go
+            // through a runtime stream, so bring the runtime up here as the
+            // host pool does.
+            spyre::startRuntime();
+            return flex::SharedMarvellPool::CreateOrAttach(
+                name, pci_bdf, num_slots, slot_bytes, bar_offset);
+          },
+          py::arg("name"), py::arg("pci_bdf"), py::arg("num_slots"),
+          py::arg("slot_bytes"), py::arg("bar_offset") = 0)
+      .def_static("unlink_by_name", &flex::SharedMarvellPool::UnlinkByName,
+                  py::arg("name"))
+      .def_property_readonly("bus_address",
+                             &flex::SharedMarvellPool::BusAddress);
 
   dci_cls.def_readonly("device_size", &spyre::SpyreTensorLayout::device_size)
       .def_readonly("stride_map", &spyre::SpyreTensorLayout::stride_map)
