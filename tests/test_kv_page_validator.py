@@ -186,8 +186,12 @@ class TestKvPageValidator(TestCase):
     def test_page_bytes_matches_geometry_across_shapes(self):
         """page_bytes must equal one page's worth of logical bytes, and every
         block_id in range must validate."""
-        for nb, bs, h, d in ((8, 128, 8, 128), (4, 64, 4, 64),
-                             (16, 128, 2, 128), (3, 128, 8, 128)):
+        for nb, bs, h, d in (
+            (8, 128, 8, 128),
+            (4, 64, 4, 64),
+            (16, 128, 2, 128),
+            (3, 128, 8, 128),
+        ):
             cache, _ = self._token_major(nb, bs, h, d)
             ca = get_composite_address(cache)
             page_bytes = ca.total_size // nb
