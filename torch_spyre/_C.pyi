@@ -10,8 +10,20 @@ import typing
 __all__: list[str] = [
     "AIUPTI_ACTIVITY_NAME_MAX_BYTES",
     "DataFormats",
+    "DestroyResult",
     "JobPlan",
     "ElementArrangement",
+    "MetadataConfig",
+    "PoolBackend",
+    "PoolCompatibility",
+    "PoolConfig",
+    "PoolDescriptor",
+    "PoolDescriptorResult",
+    "PoolGeneration",
+    "PoolResultCode",
+    "PoolState",
+    "SharedDataPoolConfig",
+    "SharedPool",
     "SpyreStreamError",
     "SpyreDeviceState",
     "SpyreTensorLayout",
@@ -52,6 +64,130 @@ __all__: list[str] = [
 
 AIUPTI_ACTIVITY_NAME_MAX_BYTES: int
 
+class PoolBackend:
+    HOST_DRAM: typing.ClassVar[PoolBackend]
+    name: str
+    value: int
+
+class PoolState:
+    INITIALIZING: typing.ClassVar[PoolState]
+    READY: typing.ClassVar[PoolState]
+    DESTROYING: typing.ClassVar[PoolState]
+    name: str
+    value: int
+
+class PoolResultCode:
+    OK: typing.ClassVar[PoolResultCode]
+    NOT_FOUND: typing.ClassVar[PoolResultCode]
+    ALREADY_EXISTS: typing.ClassVar[PoolResultCode]
+    INITIALIZING: typing.ClassVar[PoolResultCode]
+    DESTROYING: typing.ClassVar[PoolResultCode]
+    POOL_BUSY: typing.ClassVar[PoolResultCode]
+    STALE_GENERATION: typing.ClassVar[PoolResultCode]
+    CONFIGURATION_MISMATCH: typing.ClassVar[PoolResultCode]
+    RESOURCE_ERROR: typing.ClassVar[PoolResultCode]
+    name: str
+    value: int
+
+class PoolCompatibility:
+    def __init__(
+        self,
+        model: str,
+        kv_dtype: str,
+        block_size: int,
+        tensor_parallel_size: int,
+    ) -> None: ...
+    def __eq__(self, other: object) -> bool: ...
+    @property
+    def model(self) -> str: ...
+    @property
+    def kv_dtype(self) -> str: ...
+    @property
+    def block_size(self) -> int: ...
+    @property
+    def tensor_parallel_size(self) -> int: ...
+
+class MetadataConfig:
+    def __init__(self, max_chunks: int) -> None: ...
+    def __eq__(self, other: object) -> bool: ...
+    @property
+    def max_chunks(self) -> int: ...
+
+class SharedDataPoolConfig:
+    def __init__(
+        self,
+        name: str,
+        backend: PoolBackend,
+        num_slots: int,
+        slot_bytes: int,
+        compatibility: PoolCompatibility,
+    ) -> None: ...
+    def __eq__(self, other: object) -> bool: ...
+    @property
+    def name(self) -> str: ...
+    @property
+    def backend(self) -> PoolBackend: ...
+    @property
+    def num_slots(self) -> int: ...
+    @property
+    def slot_bytes(self) -> int: ...
+    @property
+    def compatibility(self) -> PoolCompatibility: ...
+
+class PoolConfig:
+    def __init__(
+        self,
+        name: str,
+        metadata: MetadataConfig,
+        data_pools: collections.abc.Sequence[SharedDataPoolConfig],
+    ) -> None: ...
+    def __eq__(self, other: object) -> bool: ...
+    @property
+    def name(self) -> str: ...
+    @property
+    def metadata(self) -> MetadataConfig: ...
+    @property
+    def data_pools(self) -> list[SharedDataPoolConfig]: ...
+
+class PoolGeneration:
+    def __eq__(self, other: object) -> bool: ...
+    @property
+    def bytes(self) -> bytes: ...
+
+class PoolDescriptor:
+    def __eq__(self, other: object) -> bool: ...
+    @property
+    def name(self) -> str: ...
+    @property
+    def generation(self) -> PoolGeneration: ...
+    @property
+    def state(self) -> PoolState: ...
+    @property
+    def effective_config(self) -> PoolConfig: ...
+
+class PoolDescriptorResult:
+    @property
+    def code(self) -> PoolResultCode: ...
+    @property
+    def descriptor(self) -> PoolDescriptor: ...
+    @property
+    def detail(self) -> str: ...
+
+class DestroyResult:
+    @property
+    def code(self) -> PoolResultCode: ...
+    @property
+    def detail(self) -> str: ...
+
+class SharedPool:
+    @staticmethod
+    def create_pool(config: PoolConfig) -> PoolDescriptorResult: ...
+    @staticmethod
+    def open_pool(name: str) -> PoolDescriptorResult: ...
+    @staticmethod
+    def destroy_pool(descriptor: PoolDescriptor) -> DestroyResult: ...
+
+def _decode_pool_descriptor_state(state: tuple[typing.Any, ...]) -> PoolDescriptor: ...
 def extract_kernel_provenance_key(event_name: str) -> str | None: ...
 def kernel_provenance_registry_stats() -> dict[str, int]: ...
 def lookup_kernel_provenance(key: str) -> list[str] | None: ...
