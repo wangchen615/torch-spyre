@@ -274,6 +274,72 @@ standard accelerator memory API is available against Spyre devices:
 
 A worked example is in :doc:`../user_guide/profiling/index`.
 
+Persistent Shared KV Pools
+--------------------------
+
+The low-level ``torch_spyre._C`` module exposes one lifecycle for a composite,
+node-local KV pool. A pool contains a shared metadata directory and a fixed
+list of data children. See :doc:`../runtime/shared_metadata` for the complete
+ownership and metadata protocols.
+
+.. class:: torch_spyre._C.PoolCompatibility(model, kv_dtype, block_size, tensor_parallel_size)
+
+   Concrete KV-layout compatibility fields stored with each data child.
+
+.. class:: torch_spyre._C.SharedDataPoolConfig(name, backend, num_slots, slot_bytes, compatibility)
+
+   Configuration for one fixed data child. ``PoolBackend.HOST_DRAM`` is the
+   currently supported backend.
+
+.. class:: torch_spyre._C.PoolConfig(name, metadata, data_pools)
+
+   Configuration for the complete generation. ``metadata`` is a
+   ``MetadataConfig`` and ``data_pools`` is the complete child list created
+   before the generation becomes ready.
+
+.. class:: torch_spyre._C.PoolDescriptor
+
+   Pickleable record containing the logical name, opaque generation,
+   lifecycle state, and effective configuration. It can be distributed with
+   ``torch.distributed.broadcast_object_list`` without attaching the sender or
+   receiver.
+
+.. class:: torch_spyre._C.SharedPool
+
+   .. staticmethod:: create_pool(config) -> PoolDescriptorResult
+
+      Create and publish a new persistent generation.
+
+   .. staticmethod:: open_pool(name) -> PoolDescriptorResult
+
+      Inspect a generation without attaching to it.
+
+   .. staticmethod:: destroy_pool(descriptor) -> DestroyResult
+
+      Destroy the descriptor's exact generation. Returns ``POOL_BUSY`` while
+      an attachment, resolved data child, or read pin retains the root lease.
+
+   .. staticmethod:: attach_pool(descriptor) -> AttachResult
+
+      Attach to a ready generation and return its ``SharedMetadata`` handle.
+
+   .. staticmethod:: detach_pool(metadata) -> None
+
+      Release one metadata attachment. Detach never unlinks the pool.
+
+.. class:: torch_spyre._C.PoolResultCode
+
+   Structured result codes: ``OK``, ``NOT_FOUND``, ``ALREADY_EXISTS``,
+   ``INITIALIZING``, ``DESTROYING``, ``POOL_BUSY``, ``STALE_GENERATION``,
+   ``CONFIGURATION_MISMATCH``, and ``RESOURCE_ERROR``.
+
+.. class:: torch_spyre._C.SharedMetadata
+
+   Attached metadata directory. It supports ``find_pool``, ``resolve_pool``,
+   ``claim``, ``publish``, ``abort``, ``lookup``, ``pin_read``, and ``evict``.
+   Resolved ``SharedDataPool`` and ``SlotReadPin`` objects retain the root
+   lease independently of this Python wrapper.
+
 Profiler
 --------
 

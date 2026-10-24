@@ -348,4 +348,5 @@ default stream, where `spyre_comms` runs every collective.
 :maxdepth: 1
 
 memory_pressure_gc
+shared_metadata
 ```
