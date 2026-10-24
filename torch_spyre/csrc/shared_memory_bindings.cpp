@@ -22,10 +22,16 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <flex/memory_interface/shared_host_pool.hpp>
+#include <flex/memory_interface/shared_metadata.hpp>
 #include <flex/memory_interface/shared_pool.hpp>
+#include <memory>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
+
+#include "module.h"
 
 namespace py = pybind11;
 
@@ -35,6 +41,45 @@ namespace {
 constexpr int kPoolDescriptorPickleVersion = 1;
 constexpr size_t kPoolDescriptorStateSize = 6;
 constexpr size_t kPoolChildStateSize = 8;
+
+class PySharedMetadata {
+ public:
+  explicit PySharedMetadata(std::shared_ptr<flex::SharedMetadata> metadata)
+      : metadata_(std::move(metadata)) {}
+
+  flex::SharedMetadata& Get() const {
+    if (!metadata_) {
+      throw std::runtime_error("SharedMetadata attachment is detached");
+    }
+    return *metadata_;
+  }
+
+  std::shared_ptr<flex::SharedMetadata> Owner() const {
+    if (!metadata_) {
+      throw std::runtime_error("SharedMetadata attachment is detached");
+    }
+    return metadata_;
+  }
+
+  void Detach() noexcept {
+    if (metadata_) {
+      flex::SharedPool::DetachPool(std::move(metadata_));
+    }
+  }
+
+  ~PySharedMetadata() {
+    Detach();
+  }
+
+ private:
+  std::shared_ptr<flex::SharedMetadata> metadata_;
+};
+
+struct PyAttachResult {
+  flex::PoolResultCode code = flex::PoolResultCode::ResourceError;
+  std::shared_ptr<PySharedMetadata> metadata;
+  std::string detail;
+};
 
 void require_tuple_size(const py::tuple& state, size_t expected,
                         const char* description) {
@@ -164,6 +209,10 @@ void init_shared_memory_bindings(py::module_& module) {
       .value("RESOURCE_ERROR", flex::PoolResultCode::ResourceError)
       .finalize();
 
+  py::native_enum<flex::SharedPoolKind>(module, "SharedPoolKind", "enum.Enum")
+      .value("HOST", flex::SharedPoolKind::HOST)
+      .finalize();
+
   py::class_<flex::PoolCompatibility>(module, "PoolCompatibility")
       .def(py::init<std::string, std::string, uint64_t, uint32_t>(),
            py::arg("model"), py::arg("kv_dtype"), py::arg("block_size"),
@@ -233,13 +282,86 @@ void init_shared_memory_bindings(py::module_& module) {
       .def_readonly("code", &flex::DestroyResult::code)
       .def_readonly("detail", &flex::DestroyResult::detail);
 
+  py::class_<flex::CompatibilityRef>(module, "CompatibilityRef")
+      .def_readonly("metadata_version",
+                    &flex::CompatibilityRef::metadata_version)
+      .def_readonly("compatibility_id",
+                    &flex::CompatibilityRef::compatibility_id)
+      .def(py::self == py::self);
+
+  py::class_<flex::PoolRef>(module, "PoolRef")
+      .def_readonly("metadata_version", &flex::PoolRef::metadata_version)
+      .def_readonly("pool_id", &flex::PoolRef::pool_id)
+      .def_readonly("pool_version", &flex::PoolRef::pool_version)
+      .def(py::self == py::self);
+
+  py::class_<flex::RegisteredPool>(module, "RegisteredPool")
+      .def_readonly("pool_ref", &flex::RegisteredPool::pool_ref)
+      .def_readonly("compatibility", &flex::RegisteredPool::compatibility)
+      .def_readonly("name", &flex::RegisteredPool::name)
+      .def_readonly("kind", &flex::RegisteredPool::kind)
+      .def_readonly("slot_count", &flex::RegisteredPool::slot_count)
+      .def_readonly("slot_bytes", &flex::RegisteredPool::slot_bytes);
+
+  py::class_<flex::SharedDataPool, std::shared_ptr<flex::SharedDataPool>>(
+      module, "SharedDataPool")
+      .def("name", &flex::SharedDataPool::Name)
+      .def("slot_count", &flex::SharedDataPool::SlotCount)
+      .def("slot_bytes", &flex::SharedDataPool::SlotBytes)
+      .def("total_bytes", &flex::SharedDataPool::TotalBytes);
+
+  py::class_<flex::SharedHostPool, flex::SharedDataPool,
+             std::shared_ptr<flex::SharedHostPool>>(module, "SharedHostPool");
+
+  py::class_<PySharedMetadata, std::shared_ptr<PySharedMetadata>>(
+      module, "SharedMetadata")
+      .def("pool_count",
+           [](const PySharedMetadata& self) { return self.Get().PoolCount(); })
+      .def("find_pool",
+           [](const PySharedMetadata& self, const std::string& name) {
+             return self.Get().FindPool(name);
+           })
+      .def("resolve_pool",
+           [](const PySharedMetadata& self, const flex::PoolRef& pool_ref) {
+             return std::const_pointer_cast<flex::SharedDataPool>(
+                 self.Get().ResolvePool(pool_ref));
+           });
+
+  py::class_<PyAttachResult>(module, "AttachResult")
+      .def_readonly("code", &PyAttachResult::code)
+      .def_readonly("metadata", &PyAttachResult::metadata)
+      .def_readonly("detail", &PyAttachResult::detail);
+
   py::class_<flex::SharedPool>(module, "SharedPool")
       .def_static("create_pool", &flex::SharedPool::CreatePool,
                   py::call_guard<py::gil_scoped_release>())
       .def_static("open_pool", &flex::SharedPool::OpenPool,
                   py::call_guard<py::gil_scoped_release>())
       .def_static("destroy_pool", &flex::SharedPool::DestroyPool,
-                  py::call_guard<py::gil_scoped_release>());
+                  py::call_guard<py::gil_scoped_release>())
+      .def_static("attach_pool",
+                  [](const flex::PoolDescriptor& descriptor) {
+                    spyre::startRuntime();
+                    flex::AttachResult attached;
+                    {
+                      py::gil_scoped_release release;
+                      attached = flex::SharedPool::AttachPool(
+                          spyre::GlobalRuntime::get(), descriptor);
+                    }
+                    PyAttachResult result{attached.code, nullptr,
+                                          std::move(attached.detail)};
+                    if (attached.metadata) {
+                      result.metadata = std::make_shared<PySharedMetadata>(
+                          std::move(attached.metadata));
+                    }
+                    return result;
+                  })
+      .def_static("detach_pool",
+                  [](const std::shared_ptr<PySharedMetadata>& metadata) {
+                    if (metadata) {
+                      metadata->Detach();
+                    }
+                  });
 
   module.def("_decode_pool_descriptor_state", decode_pool_descriptor,
              py::arg("state"));

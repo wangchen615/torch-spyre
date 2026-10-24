@@ -9,6 +9,8 @@ import typing
 
 __all__: list[str] = [
     "AIUPTI_ACTIVITY_NAME_MAX_BYTES",
+    "AttachResult",
+    "CompatibilityRef",
     "DataFormats",
     "DestroyResult",
     "JobPlan",
@@ -20,10 +22,16 @@ __all__: list[str] = [
     "PoolDescriptor",
     "PoolDescriptorResult",
     "PoolGeneration",
+    "PoolRef",
     "PoolResultCode",
     "PoolState",
+    "RegisteredPool",
+    "SharedDataPool",
     "SharedDataPoolConfig",
+    "SharedHostPool",
+    "SharedMetadata",
     "SharedPool",
+    "SharedPoolKind",
     "SpyreStreamError",
     "SpyreDeviceState",
     "SpyreTensorLayout",
@@ -86,6 +94,11 @@ class PoolResultCode:
     STALE_GENERATION: typing.ClassVar[PoolResultCode]
     CONFIGURATION_MISMATCH: typing.ClassVar[PoolResultCode]
     RESOURCE_ERROR: typing.ClassVar[PoolResultCode]
+    name: str
+    value: int
+
+class SharedPoolKind:
+    HOST: typing.ClassVar[SharedPoolKind]
     name: str
     value: int
 
@@ -179,6 +192,57 @@ class DestroyResult:
     @property
     def detail(self) -> str: ...
 
+class CompatibilityRef:
+    def __eq__(self, other: object) -> bool: ...
+    @property
+    def metadata_version(self) -> int: ...
+    @property
+    def compatibility_id(self) -> int: ...
+
+class PoolRef:
+    def __eq__(self, other: object) -> bool: ...
+    @property
+    def metadata_version(self) -> int: ...
+    @property
+    def pool_id(self) -> int: ...
+    @property
+    def pool_version(self) -> int: ...
+
+class RegisteredPool:
+    @property
+    def pool_ref(self) -> PoolRef: ...
+    @property
+    def compatibility(self) -> CompatibilityRef: ...
+    @property
+    def name(self) -> str: ...
+    @property
+    def kind(self) -> SharedPoolKind: ...
+    @property
+    def slot_count(self) -> int: ...
+    @property
+    def slot_bytes(self) -> int: ...
+
+class SharedDataPool:
+    def name(self) -> str: ...
+    def slot_count(self) -> int: ...
+    def slot_bytes(self) -> int: ...
+    def total_bytes(self) -> int: ...
+
+class SharedHostPool(SharedDataPool): ...
+
+class SharedMetadata:
+    def pool_count(self) -> int: ...
+    def find_pool(self, name: str) -> RegisteredPool | None: ...
+    def resolve_pool(self, pool_ref: PoolRef) -> SharedDataPool: ...
+
+class AttachResult:
+    @property
+    def code(self) -> PoolResultCode: ...
+    @property
+    def metadata(self) -> SharedMetadata | None: ...
+    @property
+    def detail(self) -> str: ...
+
 class SharedPool:
     @staticmethod
     def create_pool(config: PoolConfig) -> PoolDescriptorResult: ...
@@ -186,6 +250,10 @@ class SharedPool:
     def open_pool(name: str) -> PoolDescriptorResult: ...
     @staticmethod
     def destroy_pool(descriptor: PoolDescriptor) -> DestroyResult: ...
+    @staticmethod
+    def attach_pool(descriptor: PoolDescriptor) -> AttachResult: ...
+    @staticmethod
+    def detach_pool(metadata: SharedMetadata | None) -> None: ...
 
 def _decode_pool_descriptor_state(state: tuple[typing.Any, ...]) -> PoolDescriptor: ...
 def extract_kernel_provenance_key(event_name: str) -> str | None: ...
