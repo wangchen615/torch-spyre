@@ -984,6 +984,142 @@ at::Tensor& spyre_set_storage(at::Tensor& result, at::Storage storage,
   return at::cpu::set_(result, storage, storage_offset, size, stride);
 }
 
+namespace {
+
+std::vector<int64_t> row_major_strides(const std::vector<int64_t>& sizes) {
+  std::vector<int64_t> strides(sizes.size(), 1);
+  for (int i = static_cast<int>(sizes.size()) - 2; i >= 0; --i) {
+    strides[i] = strides[i + 1] * sizes[i + 1];
+  }
+  return strides;
+}
+
+struct KvPageRange {
+  size_t offset;
+  size_t length;
+};
+
+KvPageRange derive_kv_page_range(
+    const at::Tensor& cache, size_t block_id,
+    const flex::CompositeAddress* composite_address) {
+  TORCH_CHECK(cache.is_privateuseone(),
+              "copy_kv_page_raw: cache must be a Spyre tensor, got device ",
+              cache.device());
+  const SpyreTensorLayout layout = get_spyre_tensor_layout(cache);
+  const auto& device_size = layout.device_size;
+  const auto& stride_map = layout.stride_map;
+
+  TORCH_CHECK(
+      cache.dim() == 4,
+      "copy_kv_page_raw: expected a rank-4 KV cache [N,X,Y,D], got rank ",
+      cache.dim());
+  TORCH_CHECK(
+      device_size.size() == 4,
+      "copy_kv_page_raw: expected a rank-4 device layout, got rank ",
+      device_size.size(),
+      ". A generic tiled layout is not a supported KV cache; allocate it "
+      "with an explicit KV layout.");
+
+  const int64_t num_blocks = cache.size(0);
+  const int64_t head_size = cache.size(3);
+  const int64_t elements_per_stick = device_size[3];
+  TORCH_CHECK(elements_per_stick > 0, "copy_kv_page_raw: invalid stick width ",
+              elements_per_stick);
+  TORCH_CHECK(head_size % elements_per_stick == 0,
+              "copy_kv_page_raw: head_size ", head_size,
+              " is not a multiple of the stick width ", elements_per_stick,
+              "; the device image is padded and one byte range cannot "
+              "describe a page");
+
+  TORCH_CHECK(device_size[2] * device_size[3] == head_size,
+              "copy_kv_page_raw: device layout stick dims ", device_size[2],
+              "x", device_size[3], " do not cover head_size ", head_size);
+  TORCH_CHECK(stride_map == row_major_strides(device_size),
+              "copy_kv_page_raw: device stride_map is not row-major over "
+              "device_size; a page is not one contiguous interval");
+
+  TORCH_CHECK(num_blocks > 0,
+              "copy_kv_page_raw: cache has no pages (size(0) = ", num_blocks,
+              ")");
+  const int64_t inner = device_size[0] / num_blocks;
+  TORCH_CHECK(num_blocks * inner == device_size[0] &&
+                  (inner == cache.size(1) || inner == cache.size(2)),
+              "copy_kv_page_raw: device dim 0 (", device_size[0],
+              ") is not num_blocks (", num_blocks,
+              ") times the per-page inner extent (got ", inner,
+              ", expected size(1)=", cache.size(1),
+              " or size(2)=", cache.size(2),
+              "). Pass the full cache and a block_id.");
+
+  TORCH_CHECK(cache.storage_offset() == 0,
+              "copy_kv_page_raw: expected the full cache allocation "
+              "(storage_offset 0), got ",
+              cache.storage_offset());
+  TORCH_CHECK(cache.is_contiguous(),
+              "copy_kv_page_raw: expected a contiguous logical cache tensor");
+  TORCH_CHECK(static_cast<int64_t>(block_id) < num_blocks,
+              "copy_kv_page_raw: block_id ", block_id, " out of range [0, ",
+              num_blocks, ")");
+
+  const uint64_t total_bytes = get_device_size_in_bytes(layout);
+  TORCH_CHECK(total_bytes % static_cast<uint64_t>(num_blocks) == 0,
+              "copy_kv_page_raw: device image ", total_bytes,
+              " B does not divide evenly into ", num_blocks, " pages");
+  const uint64_t page_bytes = total_bytes / num_blocks;
+  const uint64_t offset = static_cast<uint64_t>(block_id) * page_bytes;
+
+  TORCH_CHECK(page_bytes > 0, "copy_kv_page_raw: computed page_bytes is zero");
+  TORCH_CHECK(offset % flex::DEVICE_ALIGNMENT == 0 &&
+                  page_bytes % flex::DEVICE_ALIGNMENT == 0,
+              "copy_kv_page_raw: page range must be ", flex::DEVICE_ALIGNMENT,
+              "-byte aligned, got offset=", offset, " length=", page_bytes);
+  const size_t allocation_bytes = composite_address->total_size();
+  TORCH_CHECK(offset + page_bytes <= allocation_bytes,
+              "copy_kv_page_raw: page range [", offset, ", ",
+              offset + page_bytes, ") exceeds the allocation (",
+              allocation_bytes, " B)");
+
+  return {static_cast<size_t>(offset), static_cast<size_t>(page_bytes)};
+}
+
+}  // namespace
+
+void copy_kv_page_raw(const at::Tensor& cache, size_t block_id,
+                      const flex::SharedDataPool& pool, size_t slot_id,
+                      bool to_device, bool non_blocking) {
+  SpyreStream stream = getCurrentStream(cache.device());
+  const flex::CompositeAddress* composite_address =
+      spyre::get_composite_address(cache);
+  const KvPageRange range =
+      derive_kv_page_range(cache, block_id, composite_address);
+
+  stream.copyRaw(pool, slot_id, composite_address, to_device,
+                 flex::Range(range.offset, range.length));
+  if (!non_blocking) {
+    stream.synchronize();
+  }
+}
+
+void copy_tensor_raw(const at::Tensor& dev_tensor,
+                     const flex::SharedDataPool& pool, size_t slot_id,
+                     bool to_device, bool non_blocking) {
+  SpyreStream stream = getCurrentStream(dev_tensor.device());
+  const size_t offset = dev_tensor.storage_offset() * dev_tensor.element_size();
+  const size_t length = dev_tensor.numel() * dev_tensor.element_size();
+  const flex::CompositeAddress* composite_address =
+      spyre::get_composite_address(dev_tensor);
+
+  TORCH_CHECK(offset % flex::DEVICE_ALIGNMENT == 0 &&
+                  length % flex::DEVICE_ALIGNMENT == 0,
+              "copy_tensor_raw: subrange must be ", flex::DEVICE_ALIGNMENT,
+              "-byte aligned, got offset=", offset, " length=", length);
+  stream.copyRaw(pool, slot_id, composite_address, to_device,
+                 flex::Range(offset, length));
+  if (!non_blocking) {
+    stream.synchronize();
+  }
+}
+
 /**
  * This method handles copy between devices. When copying to Spyre, this method
  * marks the tensor to compute on Spyre, but continue to use CPU tensor for now

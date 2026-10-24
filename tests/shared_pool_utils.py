@@ -22,6 +22,7 @@ from torch_spyre._C import PoolBackend
 from torch_spyre._C import PoolCompatibility
 from torch_spyre._C import PoolConfig
 from torch_spyre._C import PoolResultCode
+from torch_spyre._C import SharedDataPool
 from torch_spyre._C import SharedDataPoolConfig
 from torch_spyre._C import SharedPool
 
@@ -54,4 +55,52 @@ def destroy_pool_if_present(name: str) -> None:
         if result.code not in (PoolResultCode.OK, PoolResultCode.NOT_FOUND):
             raise RuntimeError(
                 f"failed to clean {name}: {result.code}: {result.detail}"
+            )
+
+
+class LifecyclePool:
+    """Own one test attachment and its resolved host child."""
+
+    def __init__(self, label: str, *, num_slots: int, slot_bytes: int) -> None:
+        self.name = unique_pool_name(label)
+        self.created = SharedPool.create_pool(
+            make_pool_config(
+                self.name,
+                num_slots=num_slots,
+                slot_bytes=slot_bytes,
+            )
+        )
+        if self.created.code is not PoolResultCode.OK:
+            raise RuntimeError(f"failed to create {self.name}: {self.created.detail}")
+
+        attached = SharedPool.attach_pool(self.created.descriptor)
+        if attached.code is not PoolResultCode.OK or attached.metadata is None:
+            SharedPool.destroy_pool(self.created.descriptor)
+            raise RuntimeError(f"failed to attach {self.name}: {attached.detail}")
+        self.metadata = attached.metadata
+        registered = self.metadata.find_pool("host-0")
+        if registered is None:
+            SharedPool.detach_pool(self.metadata)
+            SharedPool.destroy_pool(self.created.descriptor)
+            raise RuntimeError(f"host-0 is missing from {self.name}")
+        self._pool: SharedDataPool | None = self.metadata.resolve_pool(
+            registered.pool_ref
+        )
+
+    @property
+    def pool(self) -> SharedDataPool:
+        """Return the resolved child while this lifecycle owner is attached."""
+        if self._pool is None:
+            raise RuntimeError(f"pool {self.name} is closed")
+        return self._pool
+
+    def close(self) -> None:
+        """Release child and metadata leases before destroying the generation."""
+        if self._pool is not None:
+            self._pool = None
+            SharedPool.detach_pool(self.metadata)
+        destroyed = SharedPool.destroy_pool(self.created.descriptor)
+        if destroyed.code not in (PoolResultCode.OK, PoolResultCode.NOT_FOUND):
+            raise RuntimeError(
+                f"failed to destroy {self.name}: {destroyed.code}: {destroyed.detail}"
             )

@@ -11,6 +11,8 @@ __all__: list[str] = [
     "AIUPTI_ACTIVITY_NAME_MAX_BYTES",
     "AttachResult",
     "CompatibilityRef",
+    "CompositeAddressHandle",
+    "CompositeChunkInfo",
     "DataFormats",
     "DestroyResult",
     "JobPlan",
@@ -40,6 +42,7 @@ __all__: list[str] = [
     "_SpyreStreamBase",
     "current_stream",
     "default_stream",
+    "get_composite_address",
     "get_device_state",
     "get_stream_from_pool",
     "set_current_stream",
@@ -49,6 +52,8 @@ __all__: list[str] = [
     "as_strided_with_layout",
     "empty_with_layout",
     "copy_tensor",
+    "copy_tensor_raw",
+    "copy_kv_page_raw",
     "fill_tensor",
     "encode_constant",
     "extract_kernel_provenance_key",
@@ -229,6 +234,23 @@ class SharedDataPool:
     def total_bytes(self) -> int: ...
 
 class SharedHostPool(SharedDataPool): ...
+
+class CompositeChunkInfo:
+    @property
+    def region_id(self) -> int: ...
+    @property
+    def offset(self) -> int: ...
+    @property
+    def size(self) -> int: ...
+    @property
+    def domain_id(self) -> int: ...
+
+class CompositeAddressHandle:
+    @property
+    def total_size(self) -> int: ...
+    @property
+    def num_chunks(self) -> int: ...
+    def chunks(self) -> list[CompositeChunkInfo]: ...
 
 class SharedMetadata:
     def pool_count(self) -> int: ...
@@ -537,6 +559,22 @@ def copy_tensor(
     """
     ...
 
+def copy_tensor_raw(
+    dev_tensor: torch.Tensor,
+    pool: SharedDataPool,
+    slot_id: int,
+    to_device: bool,
+    non_blocking: bool = False,
+) -> None: ...
+def copy_kv_page_raw(
+    cache: torch.Tensor,
+    block_id: int,
+    pool: SharedDataPool,
+    slot_id: int,
+    to_device: bool,
+    non_blocking: bool = False,
+) -> None: ...
+def get_composite_address(tensor: torch.Tensor) -> CompositeAddressHandle: ...
 def fill_tensor(self: torch.Tensor, value: float) -> torch.Tensor:
     """
     Fill a spyre tensor with a scalar value using device-side FillDMA.

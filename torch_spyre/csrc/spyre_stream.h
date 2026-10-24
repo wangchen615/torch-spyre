@@ -20,7 +20,9 @@
 #include <c10/core/Stream.h>
 
 #include <cstdint>
+#include <flex/memory_interface/shared_data_pool.hpp>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "job_plan.h"
@@ -67,6 +69,9 @@ class SpyreStream {
   void launchFillAsync(flex::FillAsyncParams* params) const;
   // Host-side compute for deeptools host compute calls.
   flex::HostComputeBuffer* launchHostCompute(flex::HostComputeParams*) const;
+  void copyRaw(const flex::SharedDataPool& pool, size_t slot_id,
+               const flex::CompositeAddress* device_address, bool to_device,
+               std::optional<flex::Range> range = std::nullopt) const;
 
   // Conversions
   c10::Stream unwrap() const;

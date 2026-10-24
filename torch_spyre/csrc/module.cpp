@@ -477,6 +477,19 @@ PYBIND11_MODULE(_C, m) {
         "Copy tensor between host and device using DMA", py::arg("self"),
         py::arg("dst"), py::arg("non_blocking") = false);
 
+  m.def("copy_tensor_raw", &spyre::copy_tensor_raw,
+        "Copy one aligned tensor byte range through a shared pool slot",
+        py::arg("dev_tensor"), py::arg("pool"), py::arg("slot_id"),
+        py::arg("to_device"), py::arg("non_blocking") = false,
+        py::call_guard<py::gil_scoped_release>());
+
+  m.def("copy_kv_page_raw", &spyre::copy_kv_page_raw,
+        "Copy one validated physical KV-cache page through a shared pool slot",
+        py::arg("cache"), py::arg("block_id"), py::arg("pool"),
+        py::arg("slot_id"), py::arg("to_device"),
+        py::arg("non_blocking") = false,
+        py::call_guard<py::gil_scoped_release>());
+
   // Device-side fill using FillDMA (no host buffer or H2D copy)
   m.def("fill_tensor", &spyre::spyre_fill_tensor,
         "Fill a spyre tensor with a scalar value using device-side FillDMA",

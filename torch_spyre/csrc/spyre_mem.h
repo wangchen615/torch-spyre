@@ -19,6 +19,8 @@
 #include <ATen/ATen.h>
 #include <c10/util/intrusive_ptr.h>
 
+#include <flex/memory_interface/shared_data_pool.hpp>
+
 #include "module.h"
 
 namespace spyre {
@@ -31,6 +33,20 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
 
 at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
                            bool non_blocking);
+
+void copy_tensor_raw(const at::Tensor& dev_tensor,
+                     const flex::SharedDataPool& pool, size_t slot_id,
+                     bool to_device, bool non_blocking = false);
+
+/**
+ * Copy one physical KV-cache page between a shared pool slot and Spyre.
+ *
+ * The full rank-4 cache is required so this function can validate its device
+ * layout and derive the aligned physical range before submitting DMA.
+ */
+void copy_kv_page_raw(const at::Tensor& cache, size_t block_id,
+                      const flex::SharedDataPool& pool, size_t slot_id,
+                      bool to_device, bool non_blocking = false);
 
 /**
  * Uses flex::RuntimeStream::fillAsync() to perform the fill entirely

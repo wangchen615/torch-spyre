@@ -295,6 +295,22 @@ flex::HostComputeBuffer* SpyreStream::launchHostCompute(
   return resolveRuntimeHandle()->launchOperation(params);
 }
 
+void SpyreStream::copyRaw(const flex::SharedDataPool& pool, size_t slot_id,
+                          const flex::CompositeAddress* device_address,
+                          bool to_device,
+                          std::optional<flex::Range> range) const {
+  auto* params = flex::createCopyRawParams(&pool, slot_id, device_address,
+                                           to_device, range);
+  try {
+    resolveRuntimeHandle()->launchOperation(params);
+  }
+  catch (...) {
+    flex::destroyCopyRawParams(params);
+    throw;
+  }
+  flex::destroyCopyRawParams(params);
+}
+
 void SpyreStream::launch(const JobPlan& plan,
                          const std::vector<at::Tensor>& args,
                          std::vector<SymbolicArg> symbolic_args) const {
