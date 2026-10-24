@@ -1220,6 +1220,12 @@ jobs:
             config: distributed_tests/test_allreduce_compiled.yaml
           - name: Test Multi-Spyre Profiler Coll Metadata
             config: distributed_tests/test_profiler_coll_metadata.yaml
+          - name: Test Multi-Spyre Shared Host Pool
+            config: distributed_tests/test_shared_host_pool.yaml
+          - name: Test Multi-Spyre KV Offload
+            config: distributed_tests/test_kv_offload.yaml
+          - name: Test Multi-Spyre Shared Metadata
+            config: distributed_tests/test_shared_metadata.yaml
 
     steps:
       # See the `test` job above: prebaked path symlinks the baked .github into
