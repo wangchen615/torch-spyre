@@ -10,14 +10,19 @@ import typing
 __all__: list[str] = [
     "AIUPTI_ACTIVITY_NAME_MAX_BYTES",
     "AttachResult",
+    "ChunkDescriptorEntry",
     "CompatibilityRef",
     "CompositeAddressHandle",
     "CompositeChunkInfo",
+    "CompatibleBlockKey",
     "DataFormats",
     "DestroyResult",
     "JobPlan",
     "ElementArrangement",
+    "ExistingClaim",
     "MetadataConfig",
+    "LookupEntry",
+    "NoSpace",
     "PoolBackend",
     "PoolCompatibility",
     "PoolConfig",
@@ -28,17 +33,21 @@ __all__: list[str] = [
     "PoolResultCode",
     "PoolState",
     "RegisteredPool",
+    "Reservation",
     "SharedDataPool",
     "SharedDataPoolConfig",
     "SharedHostPool",
     "SharedMetadata",
     "SharedPool",
     "SharedPoolKind",
+    "SlotReadPin",
+    "SlotRef",
     "SpyreStreamError",
     "SpyreDeviceState",
     "SpyreTensorLayout",
     "SymbolicArg",
     "SymbolicArgKind",
+    "Unavailable",
     "_SpyreStreamBase",
     "current_stream",
     "default_stream",
@@ -227,6 +236,52 @@ class RegisteredPool:
     @property
     def slot_bytes(self) -> int: ...
 
+class CompatibleBlockKey:
+    def __init__(self, compatibility: CompatibilityRef, block_hash: int) -> None: ...
+    @property
+    def compatibility(self) -> CompatibilityRef: ...
+    @property
+    def block_hash(self) -> int: ...
+
+class SlotRef:
+    @property
+    def pool(self) -> PoolRef: ...
+    @property
+    def slot_id(self) -> int: ...
+    @property
+    def slot_version(self) -> int: ...
+
+class ChunkDescriptorEntry:
+    def __init__(self, domain_id: int, size: int) -> None: ...
+    @property
+    def domain_id(self) -> int: ...
+    @property
+    def size(self) -> int: ...
+
+class LookupEntry:
+    @property
+    def key(self) -> CompatibleBlockKey: ...
+    @property
+    def slot(self) -> SlotRef: ...
+    @property
+    def chunks(self) -> list[ChunkDescriptorEntry]: ...
+
+class Reservation:
+    @property
+    def key(self) -> CompatibleBlockKey: ...
+    @property
+    def slot(self) -> SlotRef: ...
+
+class ExistingClaim:
+    @property
+    def slot(self) -> SlotRef: ...
+    @property
+    def valid(self) -> bool: ...
+
+class NoSpace: ...
+class Unavailable: ...
+class SlotReadPin: ...
+
 class SharedDataPool:
     def name(self) -> str: ...
     def slot_count(self) -> int: ...
@@ -254,8 +309,19 @@ class CompositeAddressHandle:
 
 class SharedMetadata:
     def pool_count(self) -> int: ...
+    def version(self) -> int: ...
     def find_pool(self, name: str) -> RegisteredPool | None: ...
     def resolve_pool(self, pool_ref: PoolRef) -> SharedDataPool: ...
+    def lookup(self, key: CompatibleBlockKey) -> LookupEntry | None: ...
+    def pin_read(self, entry: LookupEntry) -> SlotReadPin | None: ...
+    def claim(
+        self, target_pool: PoolRef, key: CompatibleBlockKey
+    ) -> Reservation | ExistingClaim | NoSpace | Unavailable: ...
+    def publish(
+        self, reservation: Reservation, chunks: list[ChunkDescriptorEntry]
+    ) -> None: ...
+    def abort(self, reservation: Reservation) -> None: ...
+    def evict(self, entry: LookupEntry) -> bool: ...
 
 class AttachResult:
     @property

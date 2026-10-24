@@ -26,9 +26,11 @@
 #include <flex/memory_interface/shared_metadata.hpp>
 #include <flex/memory_interface/shared_pool.hpp>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "module.h"
@@ -73,6 +75,17 @@ class PySharedMetadata {
 
  private:
   std::shared_ptr<flex::SharedMetadata> metadata_;
+};
+
+class PySlotReadPin {
+ public:
+  PySlotReadPin(flex::SlotReadPin pin,
+                std::shared_ptr<flex::SharedMetadata> owner)
+      : owner_(std::move(owner)), pin_(std::move(pin)) {}
+
+ private:
+  std::shared_ptr<flex::SharedMetadata> owner_;
+  flex::SlotReadPin pin_;
 };
 
 struct PyAttachResult {
@@ -303,6 +316,47 @@ void init_shared_memory_bindings(py::module_& module) {
       .def_readonly("slot_count", &flex::RegisteredPool::slot_count)
       .def_readonly("slot_bytes", &flex::RegisteredPool::slot_bytes);
 
+  py::class_<flex::CompatibleBlockKey>(module, "CompatibleBlockKey")
+      .def(py::init([](flex::CompatibilityRef compatibility,
+                       flex::BlockHash block_hash) {
+             return flex::CompatibleBlockKey{compatibility, block_hash};
+           }),
+           py::arg("compatibility"), py::arg("block_hash"))
+      .def_readonly("compatibility", &flex::CompatibleBlockKey::compatibility)
+      .def_readonly("block_hash", &flex::CompatibleBlockKey::block_hash);
+
+  py::class_<flex::SlotRef>(module, "SlotRef")
+      .def_readonly("pool", &flex::SlotRef::pool)
+      .def_readonly("slot_id", &flex::SlotRef::slot_id)
+      .def_readonly("slot_version", &flex::SlotRef::slot_version);
+
+  py::class_<flex::ChunkDescriptorEntry>(module, "ChunkDescriptorEntry")
+      .def(py::init([](uint32_t domain_id, uint64_t size) {
+             return flex::ChunkDescriptorEntry{domain_id, size};
+           }),
+           py::arg("domain_id"), py::arg("size"))
+      .def_readonly("domain_id", &flex::ChunkDescriptorEntry::domain_id)
+      .def_readonly("size", &flex::ChunkDescriptorEntry::size);
+
+  py::class_<flex::LookupEntry>(module, "LookupEntry")
+      .def_readonly("key", &flex::LookupEntry::key)
+      .def_readonly("slot", &flex::LookupEntry::slot)
+      .def_readonly("chunks", &flex::LookupEntry::chunks);
+
+  py::class_<flex::Reservation>(module, "Reservation")
+      .def_property_readonly("key", &flex::Reservation::Key,
+                             py::return_value_policy::reference_internal)
+      .def_property_readonly("slot", &flex::Reservation::Slot,
+                             py::return_value_policy::reference_internal);
+
+  py::class_<flex::ExistingClaim>(module, "ExistingClaim")
+      .def_readonly("slot", &flex::ExistingClaim::slot)
+      .def_readonly("valid", &flex::ExistingClaim::valid);
+
+  py::class_<flex::NoSpace>(module, "NoSpace");
+  py::class_<flex::Unavailable>(module, "Unavailable");
+  py::class_<PySlotReadPin>(module, "SlotReadPin");
+
   py::class_<flex::SharedDataPool, std::shared_ptr<flex::SharedDataPool>>(
       module, "SharedDataPool")
       .def("name", &flex::SharedDataPool::Name)
@@ -316,15 +370,84 @@ void init_shared_memory_bindings(py::module_& module) {
   py::class_<PySharedMetadata, std::shared_ptr<PySharedMetadata>>(
       module, "SharedMetadata")
       .def("pool_count",
-           [](const PySharedMetadata& self) { return self.Get().PoolCount(); })
+           [](const PySharedMetadata& self) {
+             auto owner = self.Owner();
+             py::gil_scoped_release release;
+             return owner->PoolCount();
+           })
+      .def("version",
+           [](const PySharedMetadata& self) {
+             auto owner = self.Owner();
+             py::gil_scoped_release release;
+             return owner->Version();
+           })
       .def("find_pool",
            [](const PySharedMetadata& self, const std::string& name) {
-             return self.Get().FindPool(name);
+             auto owner = self.Owner();
+             py::gil_scoped_release release;
+             return owner->FindPool(name);
            })
       .def("resolve_pool",
            [](const PySharedMetadata& self, const flex::PoolRef& pool_ref) {
-             return std::const_pointer_cast<flex::SharedDataPool>(
-                 self.Get().ResolvePool(pool_ref));
+             auto owner = self.Owner();
+             auto resolved = [&]() {
+               py::gil_scoped_release release;
+               return owner->ResolvePool(pool_ref);
+             }();
+             return std::const_pointer_cast<flex::SharedDataPool>(resolved);
+           })
+      .def("lookup",
+           [](const PySharedMetadata& self,
+              const flex::CompatibleBlockKey& key) {
+             auto owner = self.Owner();
+             py::gil_scoped_release release;
+             return owner->Lookup(key);
+           })
+      .def("pin_read",
+           [](const PySharedMetadata& self,
+              const flex::LookupEntry& entry) -> py::object {
+             auto owner = self.Owner();
+             auto pin = [&]() {
+               py::gil_scoped_release release;
+               return owner->PinRead(entry);
+             }();
+             if (!pin.has_value()) {
+               return py::none();
+             }
+             return py::cast(PySlotReadPin(std::move(*pin), std::move(owner)));
+           })
+      .def("claim",
+           [](const PySharedMetadata& self, const flex::PoolRef& target_pool,
+              const flex::CompatibleBlockKey& key) {
+             auto owner = self.Owner();
+             auto result = [&]() {
+               py::gil_scoped_release release;
+               return owner->Claim(target_pool, key);
+             }();
+             return std::visit(
+                 [](auto&& value) -> py::object {
+                   return py::cast(std::forward<decltype(value)>(value));
+                 },
+                 std::move(result));
+           })
+      .def("publish",
+           [](const PySharedMetadata& self, flex::Reservation& reservation,
+              const flex::ChunkDescriptor& chunks) {
+             auto owner = self.Owner();
+             py::gil_scoped_release release;
+             owner->Publish(reservation, chunks);
+           })
+      .def("abort",
+           [](const PySharedMetadata& self, flex::Reservation& reservation) {
+             auto owner = self.Owner();
+             py::gil_scoped_release release;
+             owner->Abort(reservation);
+           })
+      .def("evict",
+           [](const PySharedMetadata& self, const flex::LookupEntry& entry) {
+             auto owner = self.Owner();
+             py::gil_scoped_release release;
+             return owner->Evict(entry);
            });
 
   py::class_<PyAttachResult>(module, "AttachResult")
