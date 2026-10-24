@@ -32,11 +32,11 @@ python -m pytest \
   tests/test_shared_metadata.py -v
 ```
 
-Result: **38 passed, 1 skipped, 3 subtests passed** in 6.40 seconds.
+Result: **41 passed, 1 skipped, 7 subtests passed** in 6.69 seconds.
 
 The skipped case was `test_blocked_evict_releases_gil`, whose explicit guard
 skips when an earlier test has initialized the parent process's runtime. A
-fresh process running only that test passed in 11.48 seconds.
+fresh process running only that test passed in 11.98 seconds.
 
 This suite covers persistent generation management, descriptor pickling,
 stale-generation rejection, attachment and resolved-child lease ownership,
@@ -62,15 +62,20 @@ its one distributed test:
 
 | Configuration | Result | Time |
 |---|---:|---:|
-| `test_shared_host_pool.yaml` | 1 passed | 8.56 s |
-| `test_kv_offload.yaml` | 1 passed, 1 warning | 8.77 s |
-| `test_shared_metadata.yaml` | 1 passed | 8.05 s |
+| `test_shared_host_pool.yaml` | 1 passed | 8.09 s |
+| `test_kv_offload.yaml` | 1 passed, 1 warning | 8.17 s |
+| `test_shared_metadata.yaml` | 1 passed | 8.81 s |
 
 Only rank 0 performed `create_pool`, `open_pool`, and `destroy_pool`; rank 1
 only attached and detached. The metadata test exercised distinct-key writes,
 same-key claim election, peer reload, read-pin eviction blocking, unrelated
 progress while eviction waits, slot reuse/versioning, unpublished and
 published visibility, and rank 1 alone keeping destruction busy.
+
+A deliberate failure immediately after both ranks resolved the data child
+exited nonzero as injected. A subsequent `open_pool` returned `NOT_FOUND`,
+confirming that failure cleanup released both attachments and destroyed the
+published generation.
 
 ## Repository and regression gates
 
@@ -82,5 +87,5 @@ python -m pytest tests/test_stream.py tests/test_spyre.py -v
 - `make check-all-configs`: passed with 0 duplicate, missing, or unlabeled
   tests. It reported 183 pre-existing dead-pattern warnings.
 - Stream/device regression suite: **72 passed, 3 skipped, 5 xfailed, 16
-  subtests passed** in 29.10 seconds. The skips and expected failures are the
+  subtests passed** in 25.17 seconds. The skips and expected failures are the
   repository's configured device/dtype cases.

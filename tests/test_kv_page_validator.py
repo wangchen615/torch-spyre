@@ -124,8 +124,10 @@ class TestKvPageValidator(TestCase):
     def test_rejects_out_of_range_block(self):
         cache, num_blocks = self._token_major()
         pool = self._pool_for(cache, num_blocks, self.id())
-        with self.assertRaisesRegex(RuntimeError, "out of range"):
-            copy_kv_page_raw(cache, num_blocks, pool, 0, False)
+        for block_id in (num_blocks, 1 << 63):
+            with self.subTest(block_id=block_id):
+                with self.assertRaisesRegex(RuntimeError, "out of range"):
+                    copy_kv_page_raw(cache, block_id, pool, 0, False)
 
     def test_rejects_unaligned_head_size(self):
         cache, num_blocks = self._token_major(head_size=96)
@@ -156,8 +158,19 @@ class TestKvPageValidator(TestCase):
             view = cache[low:high]
             self.assertEqual(view.dim(), 4)
             with self.subTest(slice=(low, high)):
-                with self.assertRaisesRegex(RuntimeError, "is not num_blocks"):
+                with self.assertRaisesRegex(RuntimeError, "full cache"):
                     copy_kv_page_raw(view, 0, pool, 0, False)
+        del pool
+
+        ambiguous_cache, num_blocks = self._token_major(
+            num_blocks=8,
+            block_size=4,
+            num_kv_heads=8,
+            head_size=64,
+        )
+        pool = self._pool_for(ambiguous_cache, num_blocks, self.id())
+        with self.assertRaisesRegex(RuntimeError, "full cache"):
+            copy_kv_page_raw(ambiguous_cache[:4], 1, pool, 0, False)
 
     def test_rejects_non_contiguous(self):
         cache, num_blocks = self._token_major()

@@ -42,6 +42,50 @@ class TestKvOffload(TestCase):
         source = torch.randn(64, device="spyre", dtype=torch.float16)
         self._kv_offload_reload(source, torch.empty_like(source), self.id())
 
+    def test_raw_copy_preserves_padded_contiguous_tensor(self):
+        for shape in ((64, 96), (2, 32)):
+            with self.subTest(shape=shape):
+                source = (
+                    torch.arange(
+                        torch.Size(shape).numel(),
+                        dtype=torch.float16,
+                    )
+                    .reshape(shape)
+                    .to("spyre")
+                )
+                self._kv_offload_reload(source, torch.zeros_like(source), self.id())
+
+    def test_raw_copy_rejects_strided_view(self):
+        base = torch.arange(
+            4 * 64,
+            device="spyre",
+            dtype=torch.float16,
+        ).reshape(4, 64)
+        view = base[::2]
+        self.assertFalse(view.is_contiguous())
+        managed = LifecyclePool(
+            self.id(),
+            num_slots=1,
+            slot_bytes=get_composite_address(base).total_size,
+        )
+        try:
+            with self.assertRaisesRegex(RuntimeError, "contiguous"):
+                copy_tensor_raw(view, managed.pool, 0, to_device=False)
+        finally:
+            managed.close()
+
+    def test_raw_copy_rejects_cpu_tensor_before_address_lookup(self):
+        source = torch.zeros(64, dtype=torch.float16)
+        managed = LifecyclePool(self.id(), num_slots=1, slot_bytes=128)
+        try:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "copy_tensor_raw: tensor must be a Spyre tensor",
+            ):
+                copy_tensor_raw(source, managed.pool, 0, to_device=False)
+        finally:
+            managed.close()
+
     def test_normal_copy_tensor_unaffected(self):
         source = torch.randn(10, dtype=torch.float16)
         reloaded = source.to("spyre").to("cpu")
