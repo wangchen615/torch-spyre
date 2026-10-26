@@ -319,9 +319,15 @@ ownership and metadata protocols.
       Destroy the descriptor's exact generation. Returns ``POOL_BUSY`` while
       an attachment, resolved data child, or read pin retains the root lease.
 
+   .. staticmethod:: attach_pool(name, expected_generation) -> AttachResult
+
+      Primary worker API. Open the named generation, verify the controller-provided
+      16-byte generation token, and attach only if Flex's locked revalidation still
+      identifies that exact ready generation. This call never creates a pool.
+
    .. staticmethod:: attach_pool(descriptor) -> AttachResult
 
-      Attach to a ready generation and return its ``SharedMetadata`` handle.
+      Compatibility overload that attaches using a complete descriptor.
 
    .. staticmethod:: detach_pool(metadata) -> None
 
