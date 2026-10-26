@@ -151,6 +151,59 @@ def test_attach_result_metadata_is_none_on_stale_generation():
         destroy_pool_if_present(name)
 
 
+def test_attach_by_identity_is_primary_worker_flow():
+    """A worker must attach using only the controller-provided identity."""
+    name = unique_pool_name("identity-attach")
+    created = SharedPool.create_pool(make_pool_config(name))
+    assert created.code is PoolResultCode.OK
+    try:
+        attached = SharedPool.attach_pool(
+            created.descriptor.name,
+            created.descriptor.generation.bytes,
+        )
+
+        assert attached.code is PoolResultCode.OK
+        assert attached.metadata is not None
+        SharedPool.detach_pool(attached.metadata)
+    finally:
+        destroy_pool_if_present(name)
+
+
+def test_attach_by_identity_reports_missing_pool():
+    """Identity attach must report absence rather than create a pool."""
+    name = unique_pool_name("missing-attach")
+
+    attached = SharedPool.attach_pool(name, bytes(16))
+
+    assert attached.code is PoolResultCode.NOT_FOUND
+    assert attached.metadata is None
+
+
+def test_attach_by_identity_rejects_replacement_generation():
+    """An old worker capability must not attach a same-name replacement."""
+    name = unique_pool_name("identity-stale")
+    config = make_pool_config(name)
+    first = SharedPool.create_pool(config)
+    assert first.code is PoolResultCode.OK
+    assert SharedPool.destroy_pool(first.descriptor).code is PoolResultCode.OK
+    replacement = SharedPool.create_pool(config)
+    assert replacement.code is PoolResultCode.OK
+    try:
+        attached = SharedPool.attach_pool(name, first.descriptor.generation.bytes)
+
+        assert attached.code is PoolResultCode.STALE_GENERATION
+        assert attached.metadata is None
+    finally:
+        destroy_pool_if_present(name)
+
+
+@pytest.mark.parametrize("generation", [bytes(15), bytes(17)])
+def test_attach_by_identity_rejects_malformed_generation(generation):
+    """Generation length must be rejected before the pool is opened."""
+    with pytest.raises(ValueError, match="16 bytes"):
+        SharedPool.attach_pool(unique_pool_name("malformed-attach"), generation)
+
+
 def test_detach_is_idempotent():
     """Repeated detach calls must be safe for unconditional cleanup."""
     name = unique_pool_name("idempotent-detach")

@@ -94,6 +94,34 @@ struct PyAttachResult {
   std::string detail;
 };
 
+flex::PoolGeneration DecodeGeneration(const py::bytes& value) {
+  const std::string bytes = value;
+  if (bytes.size() != flex::PoolGeneration{}.bytes.size()) {
+    throw py::value_error("pool generation must contain exactly 16 bytes");
+  }
+  flex::PoolGeneration generation;
+  for (size_t index = 0; index < generation.bytes.size(); ++index) {
+    generation.bytes[index] = static_cast<uint8_t>(bytes[index]);
+  }
+  return generation;
+}
+
+PyAttachResult AttachDescriptor(const flex::PoolDescriptor& descriptor) {
+  spyre::startRuntime();
+  flex::AttachResult attached;
+  {
+    py::gil_scoped_release release;
+    attached =
+        flex::SharedPool::AttachPool(spyre::GlobalRuntime::get(), descriptor);
+  }
+  PyAttachResult result{attached.code, nullptr, std::move(attached.detail)};
+  if (attached.metadata) {
+    result.metadata =
+        std::make_shared<PySharedMetadata>(std::move(attached.metadata));
+  }
+  return result;
+}
+
 void require_tuple_size(const py::tuple& state, size_t expected,
                         const char* description) {
   if (state.size() != expected) {
@@ -462,23 +490,32 @@ void init_shared_memory_bindings(py::module_& module) {
                   py::call_guard<py::gil_scoped_release>())
       .def_static("destroy_pool", &flex::SharedPool::DestroyPool,
                   py::call_guard<py::gil_scoped_release>())
-      .def_static("attach_pool",
-                  [](const flex::PoolDescriptor& descriptor) {
-                    spyre::startRuntime();
-                    flex::AttachResult attached;
-                    {
-                      py::gil_scoped_release release;
-                      attached = flex::SharedPool::AttachPool(
-                          spyre::GlobalRuntime::get(), descriptor);
-                    }
-                    PyAttachResult result{attached.code, nullptr,
-                                          std::move(attached.detail)};
-                    if (attached.metadata) {
-                      result.metadata = std::make_shared<PySharedMetadata>(
-                          std::move(attached.metadata));
-                    }
-                    return result;
-                  })
+      .def_static(
+          "attach_pool",
+          [](const flex::PoolDescriptor& descriptor) {
+            return AttachDescriptor(descriptor);
+          },
+          py::arg("descriptor"))
+      .def_static(
+          "attach_pool",
+          [](const std::string& name, const py::bytes& expected_generation) {
+            const auto expected = DecodeGeneration(expected_generation);
+            flex::PoolDescriptorResult opened;
+            {
+              py::gil_scoped_release release;
+              opened = flex::SharedPool::OpenPool(name);
+            }
+            if (opened.code != flex::PoolResultCode::Ok) {
+              return PyAttachResult{opened.code, nullptr,
+                                    std::move(opened.detail)};
+            }
+            if (opened.descriptor.generation != expected) {
+              return PyAttachResult{
+                  flex::PoolResultCode::StaleGeneration, nullptr, {}};
+            }
+            return AttachDescriptor(opened.descriptor);
+          },
+          py::arg("name"), py::arg("expected_generation"))
       .def_static("detach_pool",
                   [](const std::shared_ptr<PySharedMetadata>& metadata) {
                     if (metadata) {

@@ -58,8 +58,10 @@ Pool management and worker attachment are separate operations:
   attaching to it.
 - `SharedPool.destroy_pool(descriptor)` removes that exact generation after
   all leases have drained.
-- `SharedPool.attach_pool(descriptor)` attaches a worker and returns its
-  `SharedMetadata` handle.
+- `SharedPool.attach_pool(name, generation)` is the normal worker API. It
+  opens the local descriptor, verifies the controller-provided 16-byte
+  generation, and attaches only that generation.
+- `SharedPool.attach_pool(descriptor)` remains available for compatibility.
 - `SharedPool.detach_pool(metadata)` releases that attachment. It never
   destroys or unlinks the generation.
 
@@ -76,27 +78,29 @@ destroys, while every rank only attaches and detaches during normal work.
 ```python
 import torch.distributed as dist
 
-descriptor_box = [None]
+identity_box = [None]
 if dist.get_rank() == 0:
     result = _C.SharedPool.create_pool(config)
     if result.code is not _C.PoolResultCode.OK:
         raise RuntimeError(f"create failed: {result.code}: {result.detail}")
-    descriptor_box[0] = result.descriptor
+    identity_box[0] = (
+        result.descriptor.name,
+        result.descriptor.generation.bytes,
+    )
 
-dist.broadcast_object_list(descriptor_box, src=0)
-descriptor = descriptor_box[0]
-attached = _C.SharedPool.attach_pool(descriptor)
+dist.broadcast_object_list(identity_box, src=0)
+name, generation = identity_box[0]
+attached = _C.SharedPool.attach_pool(name, generation)
 if attached.code is not _C.PoolResultCode.OK:
     raise RuntimeError(f"attach failed: {attached.code}: {attached.detail}")
 metadata = attached.metadata
 ```
 
-`PoolDescriptor` is pickleable, including its opaque 16-byte generation,
-state, effective configuration, and fixed children. It can therefore be sent
-with `broadcast_object_list`. A descriptor is only a capability record: it
-does not hold an attachment or keep the generation busy. Reusing a logical
-name produces a new generation, so an old descriptor cannot attach to or
-destroy its replacement.
+`PoolDescriptor` remains pickleable for compatibility. Normal workers only
+need the name and opaque generation returned by the delegator. Neither form
+holds an attachment or keeps the generation busy. Reusing a logical name
+produces a new generation, so an old identity cannot attach to or destroy its
+replacement.
 
 ## Lease ownership
 

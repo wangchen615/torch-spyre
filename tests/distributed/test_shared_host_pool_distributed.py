@@ -75,7 +75,7 @@ class TestSharedHostPoolCrossProcess(TestCase):
 
     def test_cross_process_shared_pool(self):
         name = f"torch-spyre-dist-host-{self.id()}"
-        descriptor_box = [None]
+        identity_box = [None]
         attached = None
         pool = None
         descriptor = None
@@ -87,11 +87,15 @@ class TestSharedHostPoolCrossProcess(TestCase):
                 opened = SharedPool.open_pool(name)
                 self.assertIs(opened.code, PoolResultCode.OK)
                 self.assertEqual(opened.descriptor, created.descriptor)
-                descriptor_box[0] = opened.descriptor
+                descriptor = opened.descriptor
+                identity_box[0] = (
+                    descriptor.name,
+                    descriptor.generation.bytes,
+                )
 
-            dist.broadcast_object_list(descriptor_box, src=0)
-            descriptor = descriptor_box[0]
-            attached = SharedPool.attach_pool(descriptor)
+            dist.broadcast_object_list(identity_box, src=0)
+            pool_name, generation = identity_box[0]
+            attached = SharedPool.attach_pool(pool_name, generation)
             self.assertIs(attached.code, PoolResultCode.OK)
             registered = attached.metadata.find_pool("host-0")
             self.assertIsNotNone(registered)
