@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Two-rank fixed-membership host-pool lifecycle verification."""
+"""Arbitrary-rank fixed-membership host-pool lifecycle verification."""
 
 import os
 
@@ -32,8 +32,9 @@ from torch_spyre._C import SharedPool
 
 if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
     pytest.skip("distributed environment is not configured", allow_module_level=True)
-if int(os.environ["WORLD_SIZE"]) != 2:
-    pytest.skip("this test requires exactly two ranks", allow_module_level=True)
+world_size = int(os.environ["WORLD_SIZE"])
+if world_size < 2:
+    pytest.skip("this test requires at least two ranks", allow_module_level=True)
 
 
 C10D_BACKEND = "spyreccl"
@@ -47,8 +48,10 @@ def destroy_pool_if_present(name):
             raise RuntimeError(f"failed to clean {name}: {result.code}")
 
 
-def make_config(name, num_slots, slot_bytes):
-    compatibility = PoolCompatibility("distributed-test", "float16", 64, 2)
+def make_config(name, num_slots, slot_bytes, tensor_parallel_size):
+    compatibility = PoolCompatibility(
+        "distributed-test", "float16", 64, tensor_parallel_size
+    )
     child = SharedDataPoolConfig(
         "host-0",
         PoolBackend.HOST_DRAM,
@@ -82,7 +85,9 @@ class TestSharedHostPoolCrossProcess(TestCase):
         try:
             if self.comm_rank == 0:
                 destroy_pool_if_present(name)
-                created = SharedPool.create_pool(make_config(name, 1, 128))
+                created = SharedPool.create_pool(
+                    make_config(name, 1, 128, dist.get_world_size())
+                )
                 self.assertIs(created.code, PoolResultCode.OK)
                 opened = SharedPool.open_pool(name)
                 self.assertIs(opened.code, PoolResultCode.OK)
