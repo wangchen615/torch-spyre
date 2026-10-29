@@ -14,6 +14,7 @@
 
 """Persistent shared-pool management binding tests."""
 
+import mmap
 import pickle
 
 import pytest
@@ -87,7 +88,9 @@ def test_pool_descriptor_pickle_round_trip():
 def test_partitioned_descriptor_and_config_pickle_round_trip():
     """Pickle transport must retain every effective arena partition."""
     name = unique_pool_name("partition-pickle")
-    compatibility = PoolCompatibility("test-model", "float16", 16, 2)
+    compatibility = PoolCompatibility(
+        "test-model", "float16", 16, 2, "layout-signature"
+    )
     partitions = [
         SharedDataPartitionConfig("host-r0-c0", 0, 0, 4, 128, None),
         SharedDataPartitionConfig("host-r0-c1", 0, 1, 4, 4097, None),
@@ -110,6 +113,10 @@ def test_partitioned_descriptor_and_config_pickle_round_trip():
         restored = pickle.loads(pickle.dumps(created.descriptor))
 
         assert restored == created.descriptor
+        assert (
+            restored.effective_config.data_pools[0].compatibility.layout_signature
+            == "layout-signature"
+        )
         effective = restored.effective_config.data_pools[0].partitions
         assert [partition.name for partition in effective] == [
             "host-r0-c0",
@@ -194,7 +201,7 @@ def test_partitioned_pickle_state_rejects_malformed_geometry_and_tokens():
         partitions,
     )
 
-    with pytest.raises(ValueError, match="offsets overlap or contain a gap"):
+    with pytest.raises(ValueError, match="offsets are not canonical"):
         _decode_pool_config_state((2, "/malformed", 2, [mixed_child]))
     with pytest.raises(ValueError, match="pickle version"):
         _decode_pool_config_state((1, "/malformed", 2, []))
@@ -204,6 +211,87 @@ def test_partitioned_pickle_state_rejects_malformed_geometry_and_tokens():
         _decode_reservation_token_state((2, 0, 0, 0, 0, 0, 0, 0, 0))
     with pytest.raises(ValueError, match="out of range|unsigned integer"):
         _decode_reservation_token_state((1, -1, 0, 0, 0, 0, 0, 0, 0))
+
+
+def test_config_pickle_accepts_raw_partition_geometry_and_preserves_order():
+    """Requested config is validated canonically without rewriting its facts."""
+    partitions = [
+        ("host-r0-c1", 0, 1, 1, 128, mmap.PAGESIZE),
+        ("host-r0-c0", 0, 0, 1, 128, 0),
+    ]
+    child = (
+        "host-0",
+        PoolBackend.HOST_DRAM.value,
+        0,
+        0,
+        "test-model",
+        "float16",
+        16,
+        1,
+        partitions,
+    )
+
+    config = _decode_pool_config_state((2, "/raw-config", 1, [child]))
+
+    decoded = config.data_pools[0].partitions
+    assert [partition.name for partition in decoded] == [
+        "host-r0-c1",
+        "host-r0-c0",
+    ]
+    assert [partition.slot_bytes for partition in decoded] == [128, 128]
+
+
+def test_descriptor_pickle_rejects_noncanonical_partition_geometry():
+    """Effective descriptors must already contain Flex's canonical geometry."""
+    generation = b"generation-00001"
+    compatibility = ("test-model", "float16", 16, 1)
+    reversed_partitions = [
+        ("host-r0-c1", 0, 1, 1, mmap.PAGESIZE, mmap.PAGESIZE),
+        ("host-r0-c0", 0, 0, 1, mmap.PAGESIZE, 0),
+    ]
+    unaligned_partitions = [("host-r0-c0", 0, 0, 1, 128, 0)]
+
+    for partitions, num_slots in [
+        (reversed_partitions, 2),
+        (unaligned_partitions, 1),
+    ]:
+        child = (
+            "host-0",
+            PoolBackend.HOST_DRAM.value,
+            num_slots,
+            mmap.PAGESIZE,
+            *compatibility,
+            partitions,
+        )
+        state = (2, "/bad-descriptor", generation, PoolState.READY.value, 1, [child])
+        with pytest.raises(ValueError, match="canonical|aligned"):
+            _decode_pool_descriptor_state(state)
+
+
+def test_descriptor_pickle_rejects_flat_geometry_overflow():
+    """Legacy-style effective geometry must not wrap native arena bytes."""
+    child = (
+        "host-0",
+        PoolBackend.HOST_DRAM.value,
+        (1 << 64) - 1,
+        2,
+        "test-model",
+        "float16",
+        16,
+        1,
+        [],
+    )
+    state = (
+        2,
+        "/overflow-descriptor",
+        b"generation-00001",
+        PoolState.READY.value,
+        1,
+        [child],
+    )
+
+    with pytest.raises(ValueError, match="overflows"):
+        _decode_pool_descriptor_state(state)
 
 
 def test_legacy_uniform_descriptor_pickle_normalizes_to_one_partition():
@@ -331,6 +419,25 @@ def test_attach_by_identity_is_primary_worker_flow():
         assert attached.code is PoolResultCode.OK
         assert attached.metadata is not None
         SharedPool.detach_pool(attached.metadata)
+    finally:
+        destroy_pool_if_present(name)
+
+
+def test_attach_by_identity_attests_expected_effective_config():
+    """Identity attach must reject a worker plan for another physical layout."""
+    name = unique_pool_name("attested-attach")
+    created = SharedPool.create_pool(make_pool_config(name))
+    assert created.code is PoolResultCode.OK
+    incompatible = make_pool_config(name, slot_bytes=8192)
+    try:
+        attached = SharedPool.attach_pool(
+            name,
+            created.descriptor.generation.bytes,
+            incompatible,
+        )
+
+        assert attached.code is PoolResultCode.CONFIGURATION_MISMATCH
+        assert attached.metadata is None
     finally:
         destroy_pool_if_present(name)
 

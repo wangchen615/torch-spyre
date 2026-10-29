@@ -125,6 +125,7 @@ class PoolCompatibility:
         kv_dtype: str,
         block_size: int,
         tensor_parallel_size: int,
+        layout_signature: str = "",
     ) -> None: ...
     def __eq__(self, other: object) -> bool: ...
     @property
@@ -135,6 +136,8 @@ class PoolCompatibility:
     def block_size(self) -> int: ...
     @property
     def tensor_parallel_size(self) -> int: ...
+    @property
+    def layout_signature(self) -> str: ...
 
 class MetadataConfig:
     def __init__(self, max_chunks: int) -> None: ...
@@ -181,6 +184,16 @@ class SharedDataPoolConfig:
         self,
         name: str,
         backend: PoolBackend,
+        partitions: collections.abc.Sequence[SharedDataPartitionConfig],
+        compatibility: PoolCompatibility,
+    ) -> None: ...
+    @typing.overload
+    def __init__(
+        self,
+        name: str,
+        backend: PoolBackend,
+        num_slots: int,
+        slot_bytes: int,
         partitions: collections.abc.Sequence[SharedDataPartitionConfig],
         compatibility: PoolCompatibility,
     ) -> None: ...
@@ -400,6 +413,11 @@ class SharedPool:
     @staticmethod
     @typing.overload
     def attach_pool(name: str, expected_generation: bytes) -> AttachResult: ...
+    @staticmethod
+    @typing.overload
+    def attach_pool(
+        name: str, expected_generation: bytes, expected_config: PoolConfig
+    ) -> AttachResult: ...
     @staticmethod
     def detach_pool(metadata: SharedMetadata | None) -> None: ...
 

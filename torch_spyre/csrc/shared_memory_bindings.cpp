@@ -19,7 +19,9 @@
 #include <pybind11/native_enum.h>
 #include <pybind11/operators.h>
 #include <pybind11/stl.h>
+#include <unistd.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <flex/memory_interface/shared_host_pool.hpp>
@@ -43,11 +45,13 @@ namespace torch_spyre::shared_memory {
 namespace {
 
 constexpr int kLegacyPoolDescriptorPickleVersion = 1;
-constexpr int kPoolPickleVersion = 2;
+constexpr int kPartitionedPoolPickleVersion = 2;
+constexpr int kPoolPickleVersion = 3;
 constexpr size_t kPoolDescriptorStateSize = 6;
 constexpr size_t kPoolConfigStateSize = 4;
 constexpr size_t kLegacyPoolChildStateSize = 8;
-constexpr size_t kPoolChildStateSize = 9;
+constexpr size_t kPartitionedPoolChildStateSize = 9;
+constexpr size_t kPoolChildStateSize = 10;
 constexpr size_t kPoolPartitionStateSize = 6;
 constexpr size_t kReservationTokenStateSize = 9;
 
@@ -129,6 +133,23 @@ PyAttachResult AttachDescriptor(const flex::PoolDescriptor& descriptor) {
   return result;
 }
 
+size_t HostPageSize() {
+  const int64_t value = sysconf(_SC_PAGESIZE);
+  if (value <= 0) {
+    throw py::value_error("failed to determine host page size");
+  }
+  return static_cast<size_t>(value);
+}
+
+size_t AlignUp(size_t value, size_t alignment, const char* description) {
+  const size_t remainder = value % alignment;
+  if (remainder != 0 &&
+      value > std::numeric_limits<size_t>::max() - (alignment - remainder)) {
+    throw py::value_error(std::string(description) + " alignment overflows");
+  }
+  return remainder == 0 ? value : value + alignment - remainder;
+}
+
 void require_tuple_size(const py::tuple& state, size_t expected,
                         const char* description) {
   if (state.size() != expected) {
@@ -198,14 +219,20 @@ py::list encode_pool_children(
     child_state[5] = child.compatibility.kv_dtype;
     child_state[6] = child.compatibility.block_size;
     child_state[7] = child.compatibility.tensor_parallel_size;
-    child_state[8] = std::move(partitions);
+    child_state[8] = child.compatibility.layout_signature;
+    child_state[9] = std::move(partitions);
     children.append(std::move(child_state));
   }
   return children;
 }
 
+enum class PoolGeometryKind {
+  RequestedConfig,
+  EffectiveDescriptor,
+};
+
 std::vector<flex::SharedDataPoolConfig> decode_pool_children(
-    const py::handle& value, int version) {
+    const py::handle& value, int version, PoolGeometryKind geometry_kind) {
   if (!py::isinstance<py::list>(value)) {
     throw py::value_error("PoolConfig children must be a list");
   }
@@ -218,8 +245,12 @@ std::vector<flex::SharedDataPoolConfig> decode_pool_children(
     const auto child = py::reinterpret_borrow<py::tuple>(child_handle);
     const size_t expected = version == kLegacyPoolDescriptorPickleVersion
                                 ? kLegacyPoolChildStateSize
-                                : kPoolChildStateSize;
+                                : (version == kPartitionedPoolPickleVersion
+                                       ? kPartitionedPoolChildStateSize
+                                       : kPoolChildStateSize);
     require_tuple_size(child, expected, "PoolConfig child");
+    const bool has_layout_signature = version >= kPoolPickleVersion;
+    const size_t partitions_index = has_layout_signature ? 9 : 8;
     flex::SharedDataPoolConfig decoded{
         .name = child[0].cast<std::string>(),
         .backend = decode_pool_backend(
@@ -233,11 +264,18 @@ std::vector<flex::SharedDataPoolConfig> decode_pool_children(
                           .block_size = decode_unsigned<uint64_t>(
                               child[6], "PoolConfig block_size"),
                           .tensor_parallel_size = decode_unsigned<uint32_t>(
-                              child[7], "PoolConfig tensor_parallel_size")}};
+                              child[7], "PoolConfig tensor_parallel_size"),
+                          .layout_signature = has_layout_signature
+                                                  ? child[8].cast<std::string>()
+                                                  : std::string{}}};
 
     if (version == kLegacyPoolDescriptorPickleVersion) {
       if (decoded.num_slots == 0 || decoded.slot_bytes == 0) {
         throw py::value_error("legacy PoolConfig geometry is invalid");
+      }
+      if (decoded.num_slots >
+          std::numeric_limits<size_t>::max() / decoded.slot_bytes) {
+        throw py::value_error("legacy PoolConfig arena size overflows size_t");
       }
       decoded.partitions.push_back({.name = decoded.name,
                                     .tp_rank = 0,
@@ -248,12 +286,12 @@ std::vector<flex::SharedDataPoolConfig> decode_pool_children(
       decoded.num_slots = 0;
       decoded.slot_bytes = 0;
     } else {
-      if (!py::isinstance<py::list>(child[8])) {
+      if (!py::isinstance<py::list>(child[partitions_index])) {
         throw py::value_error("PoolConfig partitions must be a list");
       }
       std::unordered_set<uint64_t> identities;
-      size_t arena_bytes = 0;
-      for (const py::handle partition_handle : child[8].cast<py::list>()) {
+      for (const py::handle partition_handle :
+           child[partitions_index].cast<py::list>()) {
         if (!py::isinstance<py::tuple>(partition_handle)) {
           throw py::value_error("PoolConfig partition must be a tuple");
         }
@@ -287,31 +325,80 @@ std::vector<flex::SharedDataPoolConfig> decode_pool_children(
           throw py::value_error(
               "PoolConfig partition rank/cache identity is duplicated");
         }
-        if (item.offset_bytes.has_value() &&
-            *item.offset_bytes != arena_bytes) {
-          throw py::value_error(
-              "PoolConfig partition offsets overlap or contain a gap");
-        }
-        if (item.num_slots >
-            std::numeric_limits<size_t>::max() / item.slot_bytes) {
-          throw py::value_error("PoolConfig partition size overflows size_t");
-        }
-        const size_t partition_bytes = item.num_slots * item.slot_bytes;
-        if (arena_bytes >
-            std::numeric_limits<size_t>::max() - partition_bytes) {
-          throw py::value_error("PoolConfig arena size overflows size_t");
-        }
-        arena_bytes += partition_bytes;
         decoded.partitions.push_back(std::move(item));
       }
       if (decoded.partitions.empty()) {
         if (decoded.num_slots == 0 || decoded.slot_bytes == 0) {
           throw py::value_error("PoolConfig geometry is empty");
         }
+        if (decoded.num_slots >
+            std::numeric_limits<size_t>::max() / decoded.slot_bytes) {
+          throw py::value_error("PoolConfig arena size overflows size_t");
+        }
+        children.push_back(std::move(decoded));
+        continue;
+      }
+
+      std::vector<const flex::SharedDataPartitionConfig*> canonical;
+      canonical.reserve(decoded.partitions.size());
+      for (const auto& partition : decoded.partitions) {
+        canonical.push_back(&partition);
+      }
+      std::sort(canonical.begin(), canonical.end(),
+                [](const auto* left, const auto* right) {
+                  return std::pair{left->tp_rank, left->cache_index} <
+                         std::pair{right->tp_rank, right->cache_index};
+                });
+
+      const size_t page_size = HostPageSize();
+      size_t arena_bytes = 0;
+      for (size_t index = 0; index < canonical.size(); ++index) {
+        const auto& item = *canonical[index];
+        if (geometry_kind == PoolGeometryKind::EffectiveDescriptor &&
+            &item != &decoded.partitions[index]) {
+          throw py::value_error(
+              "PoolDescriptor partition order is not canonical");
+        }
+        const size_t slot_bytes =
+            geometry_kind == PoolGeometryKind::EffectiveDescriptor
+                ? item.slot_bytes
+                : AlignUp(item.slot_bytes, page_size,
+                          "PoolConfig partition slot size");
+        if (geometry_kind == PoolGeometryKind::EffectiveDescriptor &&
+            slot_bytes % page_size != 0) {
+          throw py::value_error(
+              "PoolDescriptor partition slot size is not page aligned");
+        }
+        if (item.offset_bytes.has_value() &&
+            *item.offset_bytes != arena_bytes) {
+          throw py::value_error(
+              "PoolConfig partition offsets are not canonical");
+        }
+        if (geometry_kind == PoolGeometryKind::EffectiveDescriptor &&
+            !item.offset_bytes.has_value()) {
+          throw py::value_error(
+              "PoolDescriptor partition offset is not canonical");
+        }
+        if (item.num_slots > std::numeric_limits<size_t>::max() / slot_bytes) {
+          throw py::value_error("PoolConfig partition size overflows size_t");
+        }
+        const size_t partition_bytes = item.num_slots * slot_bytes;
+        if (arena_bytes >
+            std::numeric_limits<size_t>::max() - partition_bytes) {
+          throw py::value_error("PoolConfig arena size overflows size_t");
+        }
+        arena_bytes += partition_bytes;
+      }
+
+      if (geometry_kind == PoolGeometryKind::EffectiveDescriptor) {
+        if (decoded.slot_bytes != page_size ||
+            decoded.num_slots != arena_bytes / page_size) {
+          throw py::value_error(
+              "PoolDescriptor arena summary is not canonical");
+        }
       } else if (decoded.num_slots != 0 || decoded.slot_bytes != 0) {
-        if (decoded.num_slots == 0 || decoded.slot_bytes == 0 ||
-            arena_bytes % decoded.slot_bytes != 0 ||
-            decoded.num_slots != arena_bytes / decoded.slot_bytes) {
+        if (decoded.num_slots == 0 || decoded.slot_bytes != page_size ||
+            decoded.num_slots != arena_bytes / page_size) {
           throw py::value_error(
               "PoolConfig flat and partition geometry are inconsistent");
         }
@@ -334,13 +421,16 @@ py::tuple encode_pool_config(const flex::PoolConfig& config) {
 flex::PoolConfig decode_pool_config(const py::tuple& state) {
   require_tuple_size(state, kPoolConfigStateSize, "PoolConfig state");
   const int version = state[0].cast<int>();
-  if (version != kPoolPickleVersion) {
+  if (version != kPartitionedPoolPickleVersion &&
+      version != kPoolPickleVersion) {
     throw py::value_error("PoolConfig pickle version is invalid");
   }
   const std::string name = state[1].cast<std::string>();
   flex::MetadataConfig metadata{
       decode_unsigned<uint32_t>(state[2], "PoolConfig max_chunks")};
-  return {name, metadata, decode_pool_children(state[3], version)};
+  return {name, metadata,
+          decode_pool_children(state[3], version,
+                               PoolGeometryKind::RequestedConfig)};
 }
 
 py::tuple encode_pool_descriptor(const flex::PoolDescriptor& descriptor) {
@@ -360,6 +450,7 @@ flex::PoolDescriptor decode_pool_descriptor(const py::tuple& state) {
   require_tuple_size(state, kPoolDescriptorStateSize, "PoolDescriptor state");
   const int version = state[0].cast<int>();
   if (version != kLegacyPoolDescriptorPickleVersion &&
+      version != kPartitionedPoolPickleVersion &&
       version != kPoolPickleVersion) {
     throw py::value_error("PoolDescriptor pickle version is invalid");
   }
@@ -382,7 +473,8 @@ flex::PoolDescriptor decode_pool_descriptor(const py::tuple& state) {
       decode_unsigned<uint32_t>(state[3], "PoolDescriptor state"));
   flex::MetadataConfig metadata{
       decode_unsigned<uint32_t>(state[4], "PoolDescriptor max_chunks")};
-  auto children = decode_pool_children(state[5], version);
+  auto children = decode_pool_children(state[5], version,
+                                       PoolGeometryKind::EffectiveDescriptor);
 
   flex::PoolConfig config{name, metadata, std::move(children)};
   return {name, generation, pool_state, std::move(config)};
@@ -447,14 +539,17 @@ void init_shared_memory_bindings(py::module_& module) {
       .finalize();
 
   py::class_<flex::PoolCompatibility>(module, "PoolCompatibility")
-      .def(py::init<std::string, std::string, uint64_t, uint32_t>(),
-           py::arg("model"), py::arg("kv_dtype"), py::arg("block_size"),
-           py::arg("tensor_parallel_size"))
+      .def(
+          py::init<std::string, std::string, uint64_t, uint32_t, std::string>(),
+          py::arg("model"), py::arg("kv_dtype"), py::arg("block_size"),
+          py::arg("tensor_parallel_size"), py::arg("layout_signature") = "")
       .def_readonly("model", &flex::PoolCompatibility::model)
       .def_readonly("kv_dtype", &flex::PoolCompatibility::kv_dtype)
       .def_readonly("block_size", &flex::PoolCompatibility::block_size)
       .def_readonly("tensor_parallel_size",
                     &flex::PoolCompatibility::tensor_parallel_size)
+      .def_readonly("layout_signature",
+                    &flex::PoolCompatibility::layout_signature)
       .def(py::self == py::self);
 
   py::class_<flex::MetadataConfig>(module, "MetadataConfig")
@@ -514,6 +609,21 @@ void init_shared_memory_bindings(py::module_& module) {
                  .compatibility = std::move(compatibility)};
            }),
            py::arg("name"), py::arg("backend"), py::arg("partitions"),
+           py::arg("compatibility"))
+      .def(py::init([](std::string name, flex::PoolBackend backend,
+                       size_t num_slots, size_t slot_bytes,
+                       std::vector<flex::SharedDataPartitionConfig> partitions,
+                       flex::PoolCompatibility compatibility) {
+             return flex::SharedDataPoolConfig{
+                 .name = std::move(name),
+                 .backend = backend,
+                 .num_slots = num_slots,
+                 .slot_bytes = slot_bytes,
+                 .partitions = std::move(partitions),
+                 .compatibility = std::move(compatibility)};
+           }),
+           py::arg("name"), py::arg("backend"), py::arg("num_slots"),
+           py::arg("slot_bytes"), py::arg("partitions"),
            py::arg("compatibility"))
       .def_readonly("name", &flex::SharedDataPoolConfig::name)
       .def_readonly("backend", &flex::SharedDataPoolConfig::backend)
@@ -791,6 +901,29 @@ void init_shared_memory_bindings(py::module_& module) {
             return AttachDescriptor(opened.descriptor);
           },
           py::arg("name"), py::arg("expected_generation"))
+      .def_static(
+          "attach_pool",
+          [](const std::string& name, const py::bytes& expected_generation,
+             const flex::PoolConfig& expected_config) {
+            const auto expected = DecodeGeneration(expected_generation);
+            flex::PoolDescriptorResult opened;
+            {
+              py::gil_scoped_release release;
+              opened = flex::SharedPool::OpenPool(name);
+            }
+            if (opened.code != flex::PoolResultCode::Ok) {
+              return PyAttachResult{opened.code, nullptr,
+                                    std::move(opened.detail)};
+            }
+            if (opened.descriptor.generation != expected) {
+              return PyAttachResult{
+                  flex::PoolResultCode::StaleGeneration, nullptr, {}};
+            }
+            opened.descriptor.effective_config = expected_config;
+            return AttachDescriptor(opened.descriptor);
+          },
+          py::arg("name"), py::arg("expected_generation"),
+          py::arg("expected_config"))
       .def_static("detach_pool",
                   [](const std::shared_ptr<PySharedMetadata>& metadata) {
                     if (metadata) {
