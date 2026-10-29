@@ -16,6 +16,7 @@
 
 import multiprocessing
 import os
+import pickle
 import threading
 import time
 import uuid
@@ -35,6 +36,7 @@ from torch_spyre._C import PoolCompatibility
 from torch_spyre._C import PoolConfig
 from torch_spyre._C import PoolResultCode
 from torch_spyre._C import Reservation
+from torch_spyre._C import ReservationToken
 from torch_spyre._C import SharedDataPool
 from torch_spyre._C import SharedDataPoolConfig
 from torch_spyre._C import SharedPool
@@ -148,6 +150,16 @@ def _run_gil_progress_test(name, result_queue):
             SharedPool.destroy_pool(created.descriptor)
 
 
+def _round_trip_token_in_spawn(token, result_queue):
+    try:
+        restored = pickle.loads(pickle.dumps(token))
+        if restored != token:
+            raise AssertionError("reservation token changed during spawn transport")
+        result_queue.put(("ok", restored))
+    except BaseException as error:
+        result_queue.put(("error", repr(error)))
+
+
 def test_blocked_evict_releases_gil():
     if hasattr(torch, "spyre") and torch.spyre.is_initialized():
         pytest.skip("requires a fresh parent process for isolated card ownership")
@@ -184,6 +196,61 @@ def test_blocked_evict_releases_gil():
 
 
 class TestSharedMetadata(TestCase):
+    def test_reservation_token_round_trips_through_spawn_and_publishes(self):
+        created, metadata = _create_attached(self, self.id(), slots=1)
+        registered = metadata.find_pool("host-0")
+        self.assertIsNotNone(registered)
+        key = CompatibleBlockKey(registered.compatibility, 0x1180)
+        reservation = metadata.claim(registered.pool_ref, key)
+        token = reservation.token
+        self.assertIsInstance(token, ReservationToken)
+        self.assertEqual(pickle.loads(pickle.dumps(token)), token)
+
+        context = multiprocessing.get_context("spawn")
+        result_queue = context.Queue()
+        process = context.Process(
+            target=_round_trip_token_in_spawn,
+            args=(token, result_queue),
+        )
+        try:
+            process.start()
+            process.join(30)
+            self.assertFalse(process.is_alive())
+            self.assertEqual(process.exitcode, 0)
+            result = result_queue.get(timeout=2)
+            self.assertEqual(result[0], "ok", result)
+            self.assertEqual(result[1], token)
+            metadata.publish(result[1], [ChunkDescriptorEntry(0, 128)])
+            self.assertIsNotNone(metadata.lookup(key))
+        finally:
+            if process.is_alive():
+                process.terminate()
+                process.join(5)
+            result_queue.close()
+            result_queue.join_thread()
+
+    def test_stale_reservation_token_rejects_reused_slot(self):
+        _, metadata = _create_attached(self, self.id(), slots=1)
+        registered, _ = _registered_and_pool(self, metadata)
+        old_key = CompatibleBlockKey(registered.compatibility, 0x1190)
+        reservation = metadata.claim(registered.pool_ref, old_key)
+        stale = reservation.token
+        metadata.publish(stale, [ChunkDescriptorEntry(0, 128)])
+        entry = metadata.lookup(old_key)
+        self.assertTrue(metadata.evict(entry))
+
+        replacement = metadata.claim(
+            registered.pool_ref,
+            CompatibleBlockKey(registered.compatibility, 0x1191),
+        )
+        self.assertEqual(replacement.slot.slot_id, stale.slot.slot_id)
+        self.assertNotEqual(replacement.slot.slot_version, stale.slot.slot_version)
+        with self.assertRaises(RuntimeError):
+            metadata.publish(stale, [ChunkDescriptorEntry(0, 128)])
+        with self.assertRaises(RuntimeError):
+            metadata.abort(stale)
+        metadata.abort(replacement.token)
+
     def test_configured_pool_lookup_and_resolution(self):
         _, metadata = _create_attached(self, self.id(), slots=2)
         registered, pool = _registered_and_pool(self, metadata)

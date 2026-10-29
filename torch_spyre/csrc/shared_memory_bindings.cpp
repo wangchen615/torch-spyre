@@ -25,10 +25,12 @@
 #include <flex/memory_interface/shared_host_pool.hpp>
 #include <flex/memory_interface/shared_metadata.hpp>
 #include <flex/memory_interface/shared_pool.hpp>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -40,9 +42,14 @@ namespace py = pybind11;
 namespace torch_spyre::shared_memory {
 namespace {
 
-constexpr int kPoolDescriptorPickleVersion = 1;
+constexpr int kLegacyPoolDescriptorPickleVersion = 1;
+constexpr int kPoolPickleVersion = 2;
 constexpr size_t kPoolDescriptorStateSize = 6;
-constexpr size_t kPoolChildStateSize = 8;
+constexpr size_t kPoolConfigStateSize = 4;
+constexpr size_t kLegacyPoolChildStateSize = 8;
+constexpr size_t kPoolChildStateSize = 9;
+constexpr size_t kPoolPartitionStateSize = 6;
+constexpr size_t kReservationTokenStateSize = 9;
 
 class PySharedMetadata {
  public:
@@ -150,9 +157,38 @@ flex::PoolBackend decode_pool_backend(uint32_t raw) {
   return flex::PoolBackend::HostDram;
 }
 
-py::tuple encode_pool_descriptor(const flex::PoolDescriptor& descriptor) {
+template <typename T>
+T decode_unsigned(const py::handle& value, const char* description) {
+  try {
+    const auto decoded = value.cast<uint64_t>();
+    if (decoded > std::numeric_limits<T>::max()) {
+      throw py::value_error(std::string(description) + " is out of range");
+    }
+    return static_cast<T>(decoded);
+  }
+  catch (const py::cast_error&) {
+    throw py::value_error(std::string(description) +
+                          " must be an unsigned integer");
+  }
+}
+
+py::list encode_pool_children(
+    const std::vector<flex::SharedDataPoolConfig>& data_pools) {
   py::list children;
-  for (const auto& child : descriptor.effective_config.data_pools) {
+  for (const auto& child : data_pools) {
+    py::list partitions;
+    for (const auto& partition : child.partitions) {
+      py::tuple partition_state(kPoolPartitionStateSize);
+      partition_state[0] = partition.name;
+      partition_state[1] = partition.tp_rank;
+      partition_state[2] = partition.cache_index;
+      partition_state[3] = partition.num_slots;
+      partition_state[4] = partition.slot_bytes;
+      partition_state[5] = partition.offset_bytes.has_value()
+                               ? py::cast(*partition.offset_bytes)
+                               : py::none();
+      partitions.append(std::move(partition_state));
+    }
     py::tuple child_state(kPoolChildStateSize);
     child_state[0] = child.name;
     child_state[1] = static_cast<uint32_t>(child.backend);
@@ -162,24 +198,169 @@ py::tuple encode_pool_descriptor(const flex::PoolDescriptor& descriptor) {
     child_state[5] = child.compatibility.kv_dtype;
     child_state[6] = child.compatibility.block_size;
     child_state[7] = child.compatibility.tensor_parallel_size;
+    child_state[8] = std::move(partitions);
     children.append(std::move(child_state));
   }
+  return children;
+}
 
+std::vector<flex::SharedDataPoolConfig> decode_pool_children(
+    const py::handle& value, int version) {
+  if (!py::isinstance<py::list>(value)) {
+    throw py::value_error("PoolConfig children must be a list");
+  }
+  std::vector<flex::SharedDataPoolConfig> children;
+  std::unordered_set<std::string> partition_names;
+  for (const py::handle child_handle : value.cast<py::list>()) {
+    if (!py::isinstance<py::tuple>(child_handle)) {
+      throw py::value_error("PoolConfig child must be a tuple");
+    }
+    const auto child = py::reinterpret_borrow<py::tuple>(child_handle);
+    const size_t expected = version == kLegacyPoolDescriptorPickleVersion
+                                ? kLegacyPoolChildStateSize
+                                : kPoolChildStateSize;
+    require_tuple_size(child, expected, "PoolConfig child");
+    flex::SharedDataPoolConfig decoded{
+        .name = child[0].cast<std::string>(),
+        .backend = decode_pool_backend(
+            decode_unsigned<uint32_t>(child[1], "PoolConfig backend")),
+        .num_slots = decode_unsigned<size_t>(child[2], "PoolConfig num_slots"),
+        .slot_bytes =
+            decode_unsigned<size_t>(child[3], "PoolConfig slot_bytes"),
+        .partitions = {},
+        .compatibility = {.model = child[4].cast<std::string>(),
+                          .kv_dtype = child[5].cast<std::string>(),
+                          .block_size = decode_unsigned<uint64_t>(
+                              child[6], "PoolConfig block_size"),
+                          .tensor_parallel_size = decode_unsigned<uint32_t>(
+                              child[7], "PoolConfig tensor_parallel_size")}};
+
+    if (version == kLegacyPoolDescriptorPickleVersion) {
+      if (decoded.num_slots == 0 || decoded.slot_bytes == 0) {
+        throw py::value_error("legacy PoolConfig geometry is invalid");
+      }
+      decoded.partitions.push_back({.name = decoded.name,
+                                    .tp_rank = 0,
+                                    .cache_index = 0,
+                                    .num_slots = decoded.num_slots,
+                                    .slot_bytes = decoded.slot_bytes,
+                                    .offset_bytes = 0});
+      decoded.num_slots = 0;
+      decoded.slot_bytes = 0;
+    } else {
+      if (!py::isinstance<py::list>(child[8])) {
+        throw py::value_error("PoolConfig partitions must be a list");
+      }
+      std::unordered_set<uint64_t> identities;
+      size_t arena_bytes = 0;
+      for (const py::handle partition_handle : child[8].cast<py::list>()) {
+        if (!py::isinstance<py::tuple>(partition_handle)) {
+          throw py::value_error("PoolConfig partition must be a tuple");
+        }
+        const auto partition =
+            py::reinterpret_borrow<py::tuple>(partition_handle);
+        require_tuple_size(partition, kPoolPartitionStateSize,
+                           "PoolConfig partition");
+        flex::SharedDataPartitionConfig item{
+            .name = partition[0].cast<std::string>(),
+            .tp_rank =
+                decode_unsigned<uint32_t>(partition[1], "partition TP rank"),
+            .cache_index = decode_unsigned<uint32_t>(partition[2],
+                                                     "partition cache index"),
+            .num_slots =
+                decode_unsigned<size_t>(partition[3], "partition num_slots"),
+            .slot_bytes =
+                decode_unsigned<size_t>(partition[4], "partition slot_bytes"),
+            .offset_bytes = std::nullopt};
+        if (!partition[5].is_none()) {
+          item.offset_bytes =
+              decode_unsigned<size_t>(partition[5], "partition offset_bytes");
+        }
+        if (item.name.empty() || item.num_slots == 0 || item.slot_bytes == 0 ||
+            !partition_names.insert(item.name).second) {
+          throw py::value_error(
+              "PoolConfig partition identity or geometry is invalid");
+        }
+        const uint64_t identity =
+            (static_cast<uint64_t>(item.tp_rank) << 32U) | item.cache_index;
+        if (!identities.insert(identity).second) {
+          throw py::value_error(
+              "PoolConfig partition rank/cache identity is duplicated");
+        }
+        if (item.offset_bytes.has_value() &&
+            *item.offset_bytes != arena_bytes) {
+          throw py::value_error(
+              "PoolConfig partition offsets overlap or contain a gap");
+        }
+        if (item.num_slots >
+            std::numeric_limits<size_t>::max() / item.slot_bytes) {
+          throw py::value_error("PoolConfig partition size overflows size_t");
+        }
+        const size_t partition_bytes = item.num_slots * item.slot_bytes;
+        if (arena_bytes >
+            std::numeric_limits<size_t>::max() - partition_bytes) {
+          throw py::value_error("PoolConfig arena size overflows size_t");
+        }
+        arena_bytes += partition_bytes;
+        decoded.partitions.push_back(std::move(item));
+      }
+      if (decoded.partitions.empty()) {
+        if (decoded.num_slots == 0 || decoded.slot_bytes == 0) {
+          throw py::value_error("PoolConfig geometry is empty");
+        }
+      } else if (decoded.num_slots != 0 || decoded.slot_bytes != 0) {
+        if (decoded.num_slots == 0 || decoded.slot_bytes == 0 ||
+            arena_bytes % decoded.slot_bytes != 0 ||
+            decoded.num_slots != arena_bytes / decoded.slot_bytes) {
+          throw py::value_error(
+              "PoolConfig flat and partition geometry are inconsistent");
+        }
+      }
+    }
+    children.push_back(std::move(decoded));
+  }
+  return children;
+}
+
+py::tuple encode_pool_config(const flex::PoolConfig& config) {
+  py::tuple state(kPoolConfigStateSize);
+  state[0] = kPoolPickleVersion;
+  state[1] = config.name;
+  state[2] = config.metadata.max_chunks;
+  state[3] = encode_pool_children(config.data_pools);
+  return state;
+}
+
+flex::PoolConfig decode_pool_config(const py::tuple& state) {
+  require_tuple_size(state, kPoolConfigStateSize, "PoolConfig state");
+  const int version = state[0].cast<int>();
+  if (version != kPoolPickleVersion) {
+    throw py::value_error("PoolConfig pickle version is invalid");
+  }
+  const std::string name = state[1].cast<std::string>();
+  flex::MetadataConfig metadata{
+      decode_unsigned<uint32_t>(state[2], "PoolConfig max_chunks")};
+  return {name, metadata, decode_pool_children(state[3], version)};
+}
+
+py::tuple encode_pool_descriptor(const flex::PoolDescriptor& descriptor) {
   py::tuple state(kPoolDescriptorStateSize);
-  state[0] = kPoolDescriptorPickleVersion;
+  state[0] = kPoolPickleVersion;
   state[1] = descriptor.name;
   state[2] = py::bytes(
       reinterpret_cast<const char*>(descriptor.generation.bytes.data()),
       descriptor.generation.bytes.size());
   state[3] = static_cast<uint32_t>(descriptor.state);
   state[4] = descriptor.effective_config.metadata.max_chunks;
-  state[5] = std::move(children);
+  state[5] = encode_pool_children(descriptor.effective_config.data_pools);
   return state;
 }
 
 flex::PoolDescriptor decode_pool_descriptor(const py::tuple& state) {
   require_tuple_size(state, kPoolDescriptorStateSize, "PoolDescriptor state");
-  if (state[0].cast<int>() != kPoolDescriptorPickleVersion) {
+  const int version = state[0].cast<int>();
+  if (version != kLegacyPoolDescriptorPickleVersion &&
+      version != kPoolPickleVersion) {
     throw py::value_error("PoolDescriptor pickle version is invalid");
   }
   if (!py::isinstance<py::bytes>(state[2])) {
@@ -197,31 +378,42 @@ flex::PoolDescriptor decode_pool_descriptor(const py::tuple& state) {
   }
 
   const std::string name = state[1].cast<std::string>();
-  const auto pool_state = decode_pool_state(state[3].cast<uint32_t>());
-  flex::MetadataConfig metadata{state[4].cast<uint32_t>()};
-
-  if (!py::isinstance<py::list>(state[5])) {
-    throw py::value_error("PoolDescriptor children must be a list");
-  }
-  std::vector<flex::SharedDataPoolConfig> children;
-  for (const py::handle child_handle : state[5].cast<py::list>()) {
-    if (!py::isinstance<py::tuple>(child_handle)) {
-      throw py::value_error("PoolDescriptor child must be a tuple");
-    }
-    const auto child = py::reinterpret_borrow<py::tuple>(child_handle);
-    require_tuple_size(child, kPoolChildStateSize, "PoolDescriptor child");
-    children.push_back({
-        child[0].cast<std::string>(),
-        decode_pool_backend(child[1].cast<uint32_t>()),
-        child[2].cast<size_t>(),
-        child[3].cast<size_t>(),
-        {child[4].cast<std::string>(), child[5].cast<std::string>(),
-         child[6].cast<uint64_t>(), child[7].cast<uint32_t>()},
-    });
-  }
+  const auto pool_state = decode_pool_state(
+      decode_unsigned<uint32_t>(state[3], "PoolDescriptor state"));
+  flex::MetadataConfig metadata{
+      decode_unsigned<uint32_t>(state[4], "PoolDescriptor max_chunks")};
+  auto children = decode_pool_children(state[5], version);
 
   flex::PoolConfig config{name, metadata, std::move(children)};
   return {name, generation, pool_state, std::move(config)};
+}
+
+py::tuple encode_reservation_token(const flex::ReservationToken& token) {
+  return py::make_tuple(1, token.key.compatibility.metadata_version,
+                        token.key.compatibility.compatibility_id,
+                        token.key.block_hash, token.slot.pool.metadata_version,
+                        token.slot.pool.pool_id, token.slot.pool.pool_version,
+                        token.slot.slot_id, token.slot.slot_version);
+}
+
+flex::ReservationToken decode_reservation_token(const py::tuple& state) {
+  require_tuple_size(state, kReservationTokenStateSize,
+                     "ReservationToken state");
+  if (state[0].cast<int>() != 1) {
+    throw py::value_error("ReservationToken pickle version is invalid");
+  }
+  const flex::CompatibilityRef compatibility{
+      decode_unsigned<uint64_t>(state[1], "compatibility metadata version"),
+      decode_unsigned<uint32_t>(state[2], "compatibility ID")};
+  const flex::CompatibleBlockKey key{
+      compatibility, decode_unsigned<uint64_t>(state[3], "block hash")};
+  const flex::PoolRef pool{
+      decode_unsigned<uint64_t>(state[4], "pool metadata version"),
+      decode_unsigned<uint32_t>(state[5], "pool ID"),
+      decode_unsigned<uint64_t>(state[6], "pool version")};
+  const flex::SlotRef slot{pool, decode_unsigned<uint64_t>(state[7], "slot ID"),
+                           decode_unsigned<uint64_t>(state[8], "slot version")};
+  return {key, slot};
 }
 
 }  // namespace
@@ -270,15 +462,64 @@ void init_shared_memory_bindings(py::module_& module) {
       .def_readonly("max_chunks", &flex::MetadataConfig::max_chunks)
       .def(py::self == py::self);
 
+  py::class_<flex::SharedDataPartitionConfig>(module,
+                                              "SharedDataPartitionConfig")
+      .def(py::init([](std::string name, uint32_t tp_rank, uint32_t cache_index,
+                       size_t num_slots, size_t slot_bytes,
+                       std::optional<size_t> offset_bytes) {
+             return flex::SharedDataPartitionConfig{
+                 .name = std::move(name),
+                 .tp_rank = tp_rank,
+                 .cache_index = cache_index,
+                 .num_slots = num_slots,
+                 .slot_bytes = slot_bytes,
+                 .offset_bytes = offset_bytes};
+           }),
+           py::arg("name"), py::arg("tp_rank"), py::arg("cache_index"),
+           py::arg("num_slots"), py::arg("slot_bytes"),
+           py::arg("offset_bytes") = std::nullopt)
+      .def_readonly("name", &flex::SharedDataPartitionConfig::name)
+      .def_readonly("tp_rank", &flex::SharedDataPartitionConfig::tp_rank)
+      .def_readonly("cache_index",
+                    &flex::SharedDataPartitionConfig::cache_index)
+      .def_readonly("num_slots", &flex::SharedDataPartitionConfig::num_slots)
+      .def_readonly("slot_bytes", &flex::SharedDataPartitionConfig::slot_bytes)
+      .def_readonly("offset_bytes",
+                    &flex::SharedDataPartitionConfig::offset_bytes)
+      .def(py::self == py::self);
+
   py::class_<flex::SharedDataPoolConfig>(module, "SharedDataPoolConfig")
-      .def(py::init<std::string, flex::PoolBackend, size_t, size_t,
-                    flex::PoolCompatibility>(),
+      .def(py::init([](std::string name, flex::PoolBackend backend,
+                       size_t num_slots, size_t slot_bytes,
+                       flex::PoolCompatibility compatibility) {
+             return flex::SharedDataPoolConfig{
+                 .name = std::move(name),
+                 .backend = backend,
+                 .num_slots = num_slots,
+                 .slot_bytes = slot_bytes,
+                 .partitions = {},
+                 .compatibility = std::move(compatibility)};
+           }),
            py::arg("name"), py::arg("backend"), py::arg("num_slots"),
            py::arg("slot_bytes"), py::arg("compatibility"))
+      .def(py::init([](std::string name, flex::PoolBackend backend,
+                       std::vector<flex::SharedDataPartitionConfig> partitions,
+                       flex::PoolCompatibility compatibility) {
+             return flex::SharedDataPoolConfig{
+                 .name = std::move(name),
+                 .backend = backend,
+                 .num_slots = 0,
+                 .slot_bytes = 0,
+                 .partitions = std::move(partitions),
+                 .compatibility = std::move(compatibility)};
+           }),
+           py::arg("name"), py::arg("backend"), py::arg("partitions"),
+           py::arg("compatibility"))
       .def_readonly("name", &flex::SharedDataPoolConfig::name)
       .def_readonly("backend", &flex::SharedDataPoolConfig::backend)
       .def_readonly("num_slots", &flex::SharedDataPoolConfig::num_slots)
       .def_readonly("slot_bytes", &flex::SharedDataPoolConfig::slot_bytes)
+      .def_readonly("partitions", &flex::SharedDataPoolConfig::partitions)
       .def_readonly("compatibility", &flex::SharedDataPoolConfig::compatibility)
       .def(py::self == py::self);
 
@@ -289,7 +530,12 @@ void init_shared_memory_bindings(py::module_& module) {
       .def_readonly("name", &flex::PoolConfig::name)
       .def_readonly("metadata", &flex::PoolConfig::metadata)
       .def_readonly("data_pools", &flex::PoolConfig::data_pools)
-      .def(py::self == py::self);
+      .def(py::self == py::self)
+      .def(py::pickle(
+          [](const flex::PoolConfig& config) {
+            return encode_pool_config(config);
+          },
+          [](const py::tuple& state) { return decode_pool_config(state); }));
 
   py::class_<flex::PoolGeneration>(module, "PoolGeneration")
       .def_property_readonly(
@@ -351,12 +597,26 @@ void init_shared_memory_bindings(py::module_& module) {
            }),
            py::arg("compatibility"), py::arg("block_hash"))
       .def_readonly("compatibility", &flex::CompatibleBlockKey::compatibility)
-      .def_readonly("block_hash", &flex::CompatibleBlockKey::block_hash);
+      .def_readonly("block_hash", &flex::CompatibleBlockKey::block_hash)
+      .def(py::self == py::self);
 
   py::class_<flex::SlotRef>(module, "SlotRef")
       .def_readonly("pool", &flex::SlotRef::pool)
       .def_readonly("slot_id", &flex::SlotRef::slot_id)
-      .def_readonly("slot_version", &flex::SlotRef::slot_version);
+      .def_readonly("slot_version", &flex::SlotRef::slot_version)
+      .def(py::self == py::self);
+
+  py::class_<flex::ReservationToken>(module, "ReservationToken")
+      .def_readonly("key", &flex::ReservationToken::key)
+      .def_readonly("slot", &flex::ReservationToken::slot)
+      .def(py::self == py::self)
+      .def(py::pickle(
+          [](const flex::ReservationToken& token) {
+            return encode_reservation_token(token);
+          },
+          [](const py::tuple& state) {
+            return decode_reservation_token(state);
+          }));
 
   py::class_<flex::ChunkDescriptorEntry>(module, "ChunkDescriptorEntry")
       .def(py::init([](uint32_t domain_id, uint64_t size) {
@@ -375,7 +635,8 @@ void init_shared_memory_bindings(py::module_& module) {
       .def_property_readonly("key", &flex::Reservation::Key,
                              py::return_value_policy::reference_internal)
       .def_property_readonly("slot", &flex::Reservation::Slot,
-                             py::return_value_policy::reference_internal);
+                             py::return_value_policy::reference_internal)
+      .def_property_readonly("token", &flex::Reservation::Token);
 
   py::class_<flex::ExistingClaim>(module, "ExistingClaim")
       .def_readonly("slot", &flex::ExistingClaim::slot)
@@ -465,11 +726,25 @@ void init_shared_memory_bindings(py::module_& module) {
              py::gil_scoped_release release;
              owner->Publish(reservation, chunks);
            })
+      .def("publish",
+           [](const PySharedMetadata& self, const flex::ReservationToken& token,
+              const flex::ChunkDescriptor& chunks) {
+             auto owner = self.Owner();
+             py::gil_scoped_release release;
+             owner->Publish(token, chunks);
+           })
       .def("abort",
            [](const PySharedMetadata& self, flex::Reservation& reservation) {
              auto owner = self.Owner();
              py::gil_scoped_release release;
              owner->Abort(reservation);
+           })
+      .def("abort",
+           [](const PySharedMetadata& self,
+              const flex::ReservationToken& token) {
+             auto owner = self.Owner();
+             py::gil_scoped_release release;
+             owner->Abort(token);
            })
       .def("evict",
            [](const PySharedMetadata& self, const flex::LookupEntry& entry) {
@@ -524,6 +799,9 @@ void init_shared_memory_bindings(py::module_& module) {
                   });
 
   module.def("_decode_pool_descriptor_state", decode_pool_descriptor,
+             py::arg("state"));
+  module.def("_decode_pool_config_state", decode_pool_config, py::arg("state"));
+  module.def("_decode_reservation_token_state", decode_reservation_token,
              py::arg("state"));
 }
 

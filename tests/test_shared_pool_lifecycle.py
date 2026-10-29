@@ -23,8 +23,16 @@ from shared_pool_utils import make_pool_config
 from shared_pool_utils import unique_pool_name
 from torch_spyre._C import PoolResultCode
 from torch_spyre._C import PoolState
+from torch_spyre._C import PoolBackend
+from torch_spyre._C import PoolCompatibility
+from torch_spyre._C import PoolConfig
+from torch_spyre._C import MetadataConfig
+from torch_spyre._C import SharedDataPartitionConfig
+from torch_spyre._C import SharedDataPoolConfig
 from torch_spyre._C import SharedPool
+from torch_spyre._C import _decode_pool_config_state
 from torch_spyre._C import _decode_pool_descriptor_state
+from torch_spyre._C import _decode_reservation_token_state
 
 
 def test_create_open_destroy_persistent_generation():
@@ -72,6 +80,107 @@ def test_pool_descriptor_pickle_round_trip():
         assert compatibility.tensor_parallel_size == 1
     finally:
         destroy_pool_if_present(name)
+
+
+def test_partitioned_descriptor_and_config_pickle_round_trip():
+    """Pickle transport must retain every effective arena partition."""
+    name = unique_pool_name("partition-pickle")
+    compatibility = PoolCompatibility("test-model", "float16", 16, 2)
+    partitions = [
+        SharedDataPartitionConfig("host-r0-c0", 0, 0, 4, 128, None),
+        SharedDataPartitionConfig("host-r0-c1", 0, 1, 4, 4097, None),
+        SharedDataPartitionConfig("host-r1-c0", 1, 0, 4, 8192, None),
+    ]
+    config = PoolConfig(
+        name,
+        MetadataConfig(2),
+        [
+            SharedDataPoolConfig(
+                "host-0", PoolBackend.HOST_DRAM, partitions, compatibility
+            )
+        ],
+    )
+    try:
+        assert pickle.loads(pickle.dumps(config)) == config
+        created = SharedPool.create_pool(config)
+        assert created.code is PoolResultCode.OK
+
+        restored = pickle.loads(pickle.dumps(created.descriptor))
+
+        assert restored == created.descriptor
+        effective = restored.effective_config.data_pools[0].partitions
+        assert [partition.name for partition in effective] == [
+            "host-r0-c0",
+            "host-r0-c1",
+            "host-r1-c0",
+        ]
+        assert [partition.tp_rank for partition in effective] == [0, 0, 1]
+        assert [partition.cache_index for partition in effective] == [0, 1, 0]
+        assert all(partition.offset_bytes is not None for partition in effective)
+    finally:
+        destroy_pool_if_present(name)
+
+
+def test_partitioned_pickle_state_rejects_malformed_geometry_and_tokens():
+    """Versioned states must reject mixed geometry and invalid token integers."""
+    compatibility = ("test-model", "float16", 16, 2)
+    partitions = [
+        ("host-r0-c0", 0, 0, 4, 4096, 0),
+        ("host-r0-c1", 0, 1, 4, 4096, 0),
+    ]
+    mixed_child = (
+        "host-0",
+        PoolBackend.HOST_DRAM.value,
+        8,
+        4096,
+        *compatibility,
+        partitions,
+    )
+
+    with pytest.raises(ValueError, match="offsets overlap or contain a gap"):
+        _decode_pool_config_state((2, "/malformed", 2, [mixed_child]))
+    with pytest.raises(ValueError, match="pickle version"):
+        _decode_pool_config_state((1, "/malformed", 2, []))
+    with pytest.raises(ValueError, match="must contain 9 fields"):
+        _decode_reservation_token_state((1, 2, 3))
+    with pytest.raises(ValueError, match="pickle version"):
+        _decode_reservation_token_state((2, 0, 0, 0, 0, 0, 0, 0, 0))
+    with pytest.raises(ValueError, match="out of range|unsigned integer"):
+        _decode_reservation_token_state((1, -1, 0, 0, 0, 0, 0, 0, 0))
+
+
+def test_legacy_uniform_descriptor_pickle_normalizes_to_one_partition():
+    """Version-1 descriptor state remains readable as one logical partition."""
+    state = (
+        1,
+        "/legacy",
+        b"generation-00001",
+        PoolState.READY.value,
+        2,
+        [
+            (
+                "host-0",
+                PoolBackend.HOST_DRAM.value,
+                4,
+                4096,
+                "test-model",
+                "float16",
+                16,
+                1,
+            )
+        ],
+    )
+
+    descriptor = _decode_pool_descriptor_state(state)
+
+    child = descriptor.effective_config.data_pools[0]
+    assert child.num_slots == 0
+    assert child.slot_bytes == 0
+    assert len(child.partitions) == 1
+    assert child.partitions[0].name == "host-0"
+    assert child.partitions[0].num_slots == 4
+    assert child.partitions[0].slot_bytes == 4096
+    assert child.partitions[0].offset_bytes == 0
 
 
 def test_pool_descriptor_rejects_malformed_pickle_state():
