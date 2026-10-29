@@ -21,6 +21,8 @@ import pytest
 from shared_pool_utils import destroy_pool_if_present
 from shared_pool_utils import make_pool_config
 from shared_pool_utils import unique_pool_name
+from torch_spyre._C import ChunkDescriptorEntry
+from torch_spyre._C import CompatibleBlockKey
 from torch_spyre._C import PoolResultCode
 from torch_spyre._C import PoolState
 from torch_spyre._C import PoolBackend
@@ -118,6 +120,61 @@ def test_partitioned_descriptor_and_config_pickle_round_trip():
         assert [partition.cache_index for partition in effective] == [0, 1, 0]
         assert all(partition.offset_bytes is not None for partition in effective)
     finally:
+        destroy_pool_if_present(name)
+
+
+def test_partitioned_metadata_survives_the_last_detach():
+    """Zero attachments must preserve partition records and published entries."""
+    name = unique_pool_name("partition-persistent")
+    compatibility = PoolCompatibility("test-model", "float16", 16, 2)
+    partitions = [
+        SharedDataPartitionConfig("host-r0-c0", 0, 0, 4, 128, None),
+        SharedDataPartitionConfig("host-r1-c0", 1, 0, 4, 4097, None),
+    ]
+    config = PoolConfig(
+        name,
+        MetadataConfig(2),
+        [
+            SharedDataPoolConfig(
+                "host-0", PoolBackend.HOST_DRAM, partitions, compatibility
+            )
+        ],
+    )
+    first = None
+    second = None
+    try:
+        created = SharedPool.create_pool(config)
+        assert created.code is PoolResultCode.OK
+        first_result = SharedPool.attach_pool(created.descriptor)
+        assert first_result.code is PoolResultCode.OK
+        first = first_result.metadata
+        registered = first.find_pool("host-r1-c0")
+        key = CompatibleBlockKey(registered.compatibility, 0x4455)
+        reservation = first.claim(registered.pool_ref, key)
+        first.publish(reservation, [ChunkDescriptorEntry(1, 4097)])
+        SharedPool.detach_pool(first)
+        first = None
+
+        opened = SharedPool.open_pool(name)
+        assert opened.code is PoolResultCode.OK
+        assert opened.descriptor == created.descriptor
+        second_result = SharedPool.attach_pool(opened.descriptor)
+        assert second_result.code is PoolResultCode.OK
+        second = second_result.metadata
+        restored = second.find_pool("host-r1-c0")
+        assert restored.pool_ref == registered.pool_ref
+        entry = second.lookup(CompatibleBlockKey(restored.compatibility, 0x4455))
+        assert entry is not None
+        assert [(chunk.domain_id, chunk.size) for chunk in entry.chunks] == [(1, 4097)]
+        SharedPool.detach_pool(second)
+        second = None
+
+        assert SharedPool.destroy_pool(created.descriptor).code is PoolResultCode.OK
+    finally:
+        if first is not None:
+            SharedPool.detach_pool(first)
+        if second is not None:
+            SharedPool.detach_pool(second)
         destroy_pool_if_present(name)
 
 
