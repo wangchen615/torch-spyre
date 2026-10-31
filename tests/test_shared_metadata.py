@@ -63,8 +63,8 @@ def _config(name, *, slots=2, children=None):
     return PoolConfig(name, MetadataConfig(2), children)
 
 
-def _cleanup_generation(metadata, descriptor):
-    SharedPool.detach_pool(metadata)
+def _cleanup_generation(attachment, descriptor):
+    SharedPool.detach_pool(attachment)
     result = SharedPool.destroy_pool(descriptor)
     if result.code not in (
         PoolResultCode.OK,
@@ -78,35 +78,40 @@ def _create_attached(test, label, *, slots=2, children=None):
     name = _pool_name(label)
     created = SharedPool.create_pool(_config(name, slots=slots, children=children))
     test.assertIs(created.code, PoolResultCode.OK)
-    attached = SharedPool.attach_pool(created.descriptor)
+    attached = SharedPool.attach_pool(created.descriptor, 0)
     test.assertIs(attached.code, PoolResultCode.OK)
-    test.assertIsNotNone(attached.metadata)
-    test.addCleanup(_cleanup_generation, attached.metadata, created.descriptor)
-    return created, attached.metadata
+    test.assertIsNotNone(attached.attachment)
+    test.addCleanup(_cleanup_generation, attached.attachment, created.descriptor)
+    return created, attached.attachment
 
 
-def _registered_and_pool(test, metadata, name="host-0"):
-    registered = metadata.find_pool(name)
-    test.assertIsNotNone(registered)
-    pool = metadata.resolve_pool(registered.pool_ref)
+def _registered_and_pool(test, attachment, name="host-0"):
+    by_name = {item.registration.name: item for item in attachment.data_pools}
+    test.assertIn(name, by_name)
+    registered = by_name[name].registration
+    pool = by_name[name].data_pool
     test.assertIsInstance(pool, SharedDataPool)
     return registered, pool
 
 
 def _run_gil_progress_test(name, result_queue):
     created = None
+    attachment = None
+    item = None
     metadata = None
     _pool = None
     try:
         created = SharedPool.create_pool(_config(name, slots=1))
         if created.code is not PoolResultCode.OK:
             raise AssertionError(f"create failed: {created.code}")
-        attached = SharedPool.attach_pool(created.descriptor)
-        if attached.code is not PoolResultCode.OK or attached.metadata is None:
+        attached = SharedPool.attach_pool(created.descriptor, 0)
+        if attached.code is not PoolResultCode.OK or attached.attachment is None:
             raise AssertionError(f"attach failed: {attached.code}")
-        metadata = attached.metadata
-        registered = metadata.find_pool("host-0")
-        _pool = metadata.resolve_pool(registered.pool_ref)
+        attachment = attached.attachment
+        metadata = attachment.metadata
+        item = attachment.data_pools[0]
+        registered = item.registration
+        _pool = item.data_pool
         key = CompatibleBlockKey(registered.compatibility, 0x3001)
         reservation = metadata.claim(registered.pool_ref, key)
         metadata.publish(reservation, [ChunkDescriptorEntry(0, 128)])
@@ -143,9 +148,11 @@ def _run_gil_progress_test(name, result_queue):
     except BaseException as error:
         result_queue.put(("error", repr(error)))
     finally:
+        item = None
         _pool = None
-        if metadata is not None:
-            SharedPool.detach_pool(metadata)
+        metadata = None
+        if attachment is not None:
+            SharedPool.detach_pool(attachment)
         if created is not None:
             SharedPool.destroy_pool(created.descriptor)
 
@@ -166,9 +173,10 @@ def test_blocked_evict_releases_gil():
 
     context = multiprocessing.get_context("spawn")
     result_queue = context.Queue()
+    name = _pool_name("gil-progress")
     process = context.Process(
         target=_run_gil_progress_test,
-        args=(_pool_name("gil-progress"), result_queue),
+        args=(name, result_queue),
     )
     try:
         process.start()
@@ -187,17 +195,22 @@ def test_blocked_evict_releases_gil():
         assert progress == ["main-thread-ran"]
         assert not worker_alive
         assert evicted == [True]
+        assert SharedPool.open_pool(name).code is PoolResultCode.NOT_FOUND
     finally:
         if process.is_alive():
             process.terminate()
             process.join(5)
         result_queue.close()
         result_queue.join_thread()
+        opened = SharedPool.open_pool(name)
+        if opened.code is PoolResultCode.OK:
+            SharedPool.destroy_pool(opened.descriptor)
 
 
 class TestSharedMetadata(TestCase):
     def test_reservation_token_round_trips_through_spawn_and_publishes(self):
-        created, metadata = _create_attached(self, self.id(), slots=1)
+        _, attachment = _create_attached(self, self.id(), slots=1)
+        metadata = attachment.metadata
         registered = metadata.find_pool("host-0")
         self.assertIsNotNone(registered)
         key = CompatibleBlockKey(registered.compatibility, 0x1180)
@@ -230,8 +243,9 @@ class TestSharedMetadata(TestCase):
             result_queue.join_thread()
 
     def test_stale_reservation_token_rejects_reused_slot(self):
-        _, metadata = _create_attached(self, self.id(), slots=1)
-        registered, _ = _registered_and_pool(self, metadata)
+        _, attachment = _create_attached(self, self.id(), slots=1)
+        metadata = attachment.metadata
+        registered, _ = _registered_and_pool(self, attachment)
         old_key = CompatibleBlockKey(registered.compatibility, 0x1190)
         reservation = metadata.claim(registered.pool_ref, old_key)
         stale = reservation.token
@@ -252,20 +266,25 @@ class TestSharedMetadata(TestCase):
         metadata.abort(replacement.token)
 
     def test_configured_pool_lookup_and_resolution(self):
-        _, metadata = _create_attached(self, self.id(), slots=2)
-        registered, pool = _registered_and_pool(self, metadata)
+        _, attachment = _create_attached(self, self.id(), slots=2)
+        metadata = attachment.metadata
+        registered = metadata.find_pool("host-0")
+        self.assertIsNotNone(registered)
+        attached_registered, pool = _registered_and_pool(self, attachment)
 
         self.assertEqual(metadata.pool_count(), 1)
         self.assertEqual(registered.slot_count, 2)
+        self.assertEqual(attached_registered.pool_ref, registered.pool_ref)
         self.assertEqual(pool.slot_count(), 2)
         self.assertFalse(hasattr(metadata, "register_or_attach_pool"))
         self.assertFalse(hasattr(metadata, "retire_pool"))
 
     def test_compatibility_identity_and_foreign_pool_rejection(self):
-        _, metadata = _create_attached(self, self.id(), slots=1)
-        registered, _ = _registered_and_pool(self, metadata)
-        _, other_metadata = _create_attached(self, f"{self.id()}-other", slots=1)
-        other_registered, _ = _registered_and_pool(self, other_metadata)
+        _, attachment = _create_attached(self, self.id(), slots=1)
+        metadata = attachment.metadata
+        registered, _ = _registered_and_pool(self, attachment)
+        _, other_attachment = _create_attached(self, f"{self.id()}-other", slots=1)
+        other_registered, _ = _registered_and_pool(self, other_attachment)
 
         self.assertEqual(
             registered.compatibility.metadata_version,
@@ -277,8 +296,9 @@ class TestSharedMetadata(TestCase):
         )
 
     def test_claim_copy_publish_lookup_pin_copy_and_evict(self):
-        _, metadata = _create_attached(self, self.id(), slots=1)
-        registered, pool = _registered_and_pool(self, metadata)
+        _, attachment = _create_attached(self, self.id(), slots=1)
+        metadata = attachment.metadata
+        registered, pool = _registered_and_pool(self, attachment)
         key = CompatibleBlockKey(registered.compatibility, 0x1234)
         reservation = metadata.claim(registered.pool_ref, key)
         self.assertIsInstance(reservation, Reservation)
@@ -301,8 +321,9 @@ class TestSharedMetadata(TestCase):
         self.assertIsNone(metadata.lookup(key))
 
     def test_abort_returns_reserved_slot(self):
-        _, metadata = _create_attached(self, self.id(), slots=1)
-        registered, _ = _registered_and_pool(self, metadata)
+        _, attachment = _create_attached(self, self.id(), slots=1)
+        metadata = attachment.metadata
+        registered, _ = _registered_and_pool(self, attachment)
         key_a = CompatibleBlockKey(registered.compatibility, 0x2001)
         key_b = CompatibleBlockKey(registered.compatibility, 0x2002)
 
@@ -314,8 +335,9 @@ class TestSharedMetadata(TestCase):
         metadata.abort(reservation_b)
 
     def test_reserved_existing_claim_and_no_space_are_distinct(self):
-        _, metadata = _create_attached(self, self.id(), slots=1)
-        registered, _ = _registered_and_pool(self, metadata)
+        _, attachment = _create_attached(self, self.id(), slots=1)
+        metadata = attachment.metadata
+        registered, _ = _registered_and_pool(self, attachment)
         key_a = CompatibleBlockKey(registered.compatibility, 0x2101)
         key_b = CompatibleBlockKey(registered.compatibility, 0x2102)
 
@@ -327,8 +349,9 @@ class TestSharedMetadata(TestCase):
         metadata.abort(reservation)
 
     def test_failed_publish_remains_abortable(self):
-        _, metadata = _create_attached(self, self.id(), slots=1)
-        registered, _ = _registered_and_pool(self, metadata)
+        _, attachment = _create_attached(self, self.id(), slots=1)
+        metadata = attachment.metadata
+        registered, _ = _registered_and_pool(self, attachment)
         key = CompatibleBlockKey(registered.compatibility, 0x2301)
         reservation = metadata.claim(registered.pool_ref, key)
 
@@ -347,9 +370,10 @@ class TestSharedMetadata(TestCase):
                 "host-b", PoolBackend.HOST_DRAM, 1, 128, compatibility
             ),
         ]
-        _, metadata = _create_attached(self, self.id(), children=children)
-        pool_a, _ = _registered_and_pool(self, metadata, "host-a")
-        pool_b, _ = _registered_and_pool(self, metadata, "host-b")
+        _, attachment = _create_attached(self, self.id(), children=children)
+        metadata = attachment.metadata
+        pool_a, _ = _registered_and_pool(self, attachment, "host-a")
+        pool_b, _ = _registered_and_pool(self, attachment, "host-b")
         key = CompatibleBlockKey(pool_a.compatibility, 0x2401)
 
         reservation = metadata.claim(pool_a.pool_ref, key)
@@ -361,8 +385,9 @@ class TestSharedMetadata(TestCase):
         self.assertEqual(existing.slot.pool.pool_id, pool_a.pool_ref.pool_id)
 
     def test_stale_entry_cannot_pin_or_evict_reused_slot(self):
-        _, metadata = _create_attached(self, self.id(), slots=1)
-        registered, _ = _registered_and_pool(self, metadata)
+        _, attachment = _create_attached(self, self.id(), slots=1)
+        metadata = attachment.metadata
+        registered, _ = _registered_and_pool(self, attachment)
         key = CompatibleBlockKey(registered.compatibility, 0x2501)
         old_reservation = metadata.claim(registered.pool_ref, key)
         metadata.publish(old_reservation, [ChunkDescriptorEntry(0, 128)])
@@ -383,29 +408,37 @@ class TestSharedMetadata(TestCase):
         name = _pool_name(self.id())
         config = _config(name, slots=1)
         created = SharedPool.create_pool(config)
-        old_attached = SharedPool.attach_pool(created.descriptor)
-        old_metadata = old_attached.metadata
-        old_registered, old_pool = _registered_and_pool(self, old_metadata)
+        old_result = SharedPool.attach_pool(created.descriptor, 0)
+        old_attachment = old_result.attachment
+        old_metadata = old_attachment.metadata
+        old_registered, old_pool = _registered_and_pool(self, old_attachment)
         old_key = CompatibleBlockKey(old_registered.compatibility, 0x2521)
         old_reservation = old_metadata.claim(old_registered.pool_ref, old_key)
         old_metadata.publish(old_reservation, [ChunkDescriptorEntry(0, 128)])
         old_entry = old_metadata.lookup(old_key)
 
         del old_pool
-        SharedPool.detach_pool(old_metadata)
+        del old_metadata
+        SharedPool.detach_pool(old_attachment)
         self.assertIs(
             SharedPool.destroy_pool(created.descriptor).code,
             PoolResultCode.OK,
         )
         replacement = SharedPool.create_pool(config)
-        replacement_attached = SharedPool.attach_pool(replacement.descriptor)
-        metadata = replacement_attached.metadata
-        self.addCleanup(_cleanup_generation, metadata, replacement.descriptor)
-        registered, _ = _registered_and_pool(self, metadata)
+        replacement_result = SharedPool.attach_pool(replacement.descriptor, 0)
+        replacement_attachment = replacement_result.attachment
+        metadata = replacement_attachment.metadata
+        self.addCleanup(
+            _cleanup_generation, replacement_attachment, replacement.descriptor
+        )
+        registered, _ = _registered_and_pool(self, replacement_attachment)
         fresh_key = CompatibleBlockKey(registered.compatibility, 0x2521)
 
         self.assertIsNone(metadata.lookup(old_key))
-        self.assertIsNone(metadata.resolve_pool(old_registered.pool_ref))
+        self.assertNotIn(
+            old_registered.pool_ref,
+            [item.registration.pool_ref for item in replacement_attachment.data_pools],
+        )
         self.assertIsNone(metadata.pin_read(old_entry))
         self.assertFalse(metadata.evict(old_entry))
         self.assertIsInstance(
@@ -413,8 +446,9 @@ class TestSharedMetadata(TestCase):
         )
 
     def test_protocol_objects_expose_no_raw_addresses(self):
-        _, metadata = _create_attached(self, self.id(), slots=1)
-        registered, pool = _registered_and_pool(self, metadata)
+        _, attachment = _create_attached(self, self.id(), slots=1)
+        metadata = attachment.metadata
+        registered, pool = _registered_and_pool(self, attachment)
         key = CompatibleBlockKey(registered.compatibility, 0x2601)
         reservation = metadata.claim(registered.pool_ref, key)
         metadata.publish(reservation, [ChunkDescriptorEntry(0, 128)])
@@ -427,9 +461,10 @@ class TestSharedMetadata(TestCase):
             self.assertFalse(hasattr(value, "device_address"))
         del pin
 
-    def test_read_pin_retains_native_metadata_after_detach(self):
-        created, metadata = _create_attached(self, self.id(), slots=1)
-        registered, pool = _registered_and_pool(self, metadata)
+    def test_read_pin_keeps_generation_busy_after_attachment_close(self):
+        created, attachment = _create_attached(self, self.id(), slots=1)
+        metadata = attachment.metadata
+        registered, pool = _registered_and_pool(self, attachment)
         key = CompatibleBlockKey(registered.compatibility, 0x2701)
         reservation = metadata.claim(registered.pool_ref, key)
         metadata.publish(reservation, [ChunkDescriptorEntry(0, 128)])
@@ -437,7 +472,8 @@ class TestSharedMetadata(TestCase):
         pin = metadata.pin_read(entry)
 
         del pool
-        SharedPool.detach_pool(metadata)
+        del metadata
+        SharedPool.detach_pool(attachment)
         self.assertIs(
             SharedPool.destroy_pool(created.descriptor).code,
             PoolResultCode.POOL_BUSY,

@@ -1,8 +1,8 @@
 # Persistent shared KV pools
 
 Torch-Spyre exposes Flex's persistent, node-local KV pool as one composite
-resource. A generation contains one shared metadata directory and a fixed list
-of shared data pools. The generation can remain published with no attached
+resource. A generation contains one global metadata directory and fixed,
+rank-owned data arenas. The generation can remain published with no attached
 processes; it is removed only by an explicit, generation-checked destroy.
 
 The Python boundary exposes identifiers and protocol records, not raw host or
@@ -14,11 +14,12 @@ device pointers.
 
 - `name` is the logical node-local pool name.
 - `metadata.max_chunks` limits the chunk descriptors stored for one value.
-- `data_pools` is the complete, fixed child list.
+- `data_pools` is the complete, fixed arena list.
 
-Each `SharedDataPoolConfig` supplies a child name, backend, slot count, slot
-size, and `PoolCompatibility`. `HOST_DRAM` is the currently supported backend.
-The concrete compatibility fields are `model`, `kv_dtype`, `block_size`, and
+Each `SharedDataPoolConfig` supplies an arena name, backend, rank-homogeneous
+partition list, and `PoolCompatibility`. Every partition in one arena must
+belong to the same TP rank. `HOST_DRAM` is the currently supported backend. The
+concrete compatibility fields are `model`, `kv_dtype`, `block_size`, and
 `tensor_parallel_size`. They prevent workers with incompatible KV layouts from
 sharing bytes accidentally.
 
@@ -35,17 +36,22 @@ compatibility = _C.PoolCompatibility(
     block_size=64,
     tensor_parallel_size=2,
 )
-child = _C.SharedDataPoolConfig(
-    "host-0",
+rank_0 = _C.SharedDataPoolConfig(
+    "arena-r0",
     _C.PoolBackend.HOST_DRAM,
-    128,
-    4096,
+    [_C.SharedDataPartitionConfig("host-r0", 0, 0, 128, 4096)],
+    compatibility,
+)
+rank_1 = _C.SharedDataPoolConfig(
+    "arena-r1",
+    _C.PoolBackend.HOST_DRAM,
+    [_C.SharedDataPartitionConfig("host-r1", 1, 0, 128, 4096)],
     compatibility,
 )
 config = _C.PoolConfig(
     "kv-cache",
     _C.MetadataConfig(max_chunks=2),
-    [child],
+    [rank_0, rank_1],
 )
 ```
 
@@ -58,15 +64,17 @@ Pool management and worker attachment are separate operations:
   attaching to it.
 - `SharedPool.destroy_pool(descriptor)` removes that exact generation after
   all leases have drained.
-- `SharedPool.attach_pool(name, generation)` is the normal worker API. It
+- `SharedPool.attach_pool(name, generation, tp_rank)` is the normal worker API. It
   opens the local descriptor, verifies the controller-provided 16-byte
-  generation, and attaches only that generation.
-- `SharedPool.attach_pool(descriptor)` remains available for compatibility.
-- `SharedPool.detach_pool(metadata)` releases that attachment. It never
+  generation, and returns the global metadata plus all mapped data partitions
+  for that rank.
+- `SharedPool.attach_pool(descriptor, tp_rank)` provides the same rank-scoped
+  operation for a complete descriptor.
+- `SharedPool.detach_pool(attachment)` closes that aggregate. It never
   destroys or unlinks the generation.
 
 These methods return structured results. Check `result.code` before reading
-the descriptor or metadata. `PoolResultCode` contains `OK`, `NOT_FOUND`,
+the descriptor or attachment. `PoolResultCode` contains `OK`, `NOT_FOUND`,
 `ALREADY_EXISTS`, `INITIALIZING`, `DESTROYING`, `POOL_BUSY`,
 `STALE_GENERATION`, `CONFIGURATION_MISMATCH`, and `RESOURCE_ERROR`; `detail`
 contains diagnostic text.
@@ -90,11 +98,20 @@ if dist.get_rank() == 0:
 
 dist.broadcast_object_list(identity_box, src=0)
 name, generation = identity_box[0]
-attached = _C.SharedPool.attach_pool(name, generation)
-if attached.code is not _C.PoolResultCode.OK:
-    raise RuntimeError(f"attach failed: {attached.code}: {attached.detail}")
-metadata = attached.metadata
+tp_rank = dist.get_rank()
+result = _C.SharedPool.attach_pool(name, generation, tp_rank)
+if result.code is not _C.PoolResultCode.OK:
+    raise RuntimeError(f"attach failed: {result.code}: {result.detail}")
+attachment = result.attachment
+metadata = attachment.metadata
+local_pools = {
+    item.registration.name: item.data_pool
+    for item in attachment.data_pools
+}
 ```
+
+A successful call means the metadata mapping and every data/IOMMU mapping for
+the requested rank are ready. No later data-pool resolution step is required.
 
 `PoolDescriptor` remains pickleable for compatibility. Normal workers only
 need the name and opaque generation returned by the delegator. Neither form
@@ -104,17 +121,17 @@ replacement.
 
 ## Lease ownership
 
-An attachment holds a shared lock on the generation root. That root lease is
-also retained by every resolved `SharedDataPool` and by every `SlotReadPin`.
-This lets a data operation finish safely even if the original Python metadata
-wrapper is detached. Conversely, keeping any of those objects alive makes
-`destroy_pool` return `POOL_BUSY`.
+An attachment holds a shared lock on the generation root. Independently
+retained metadata, `SharedDataPool`, and `SlotReadPin` handles also retain that
+root lease. This lets a data operation finish safely after the aggregate is
+closed. Conversely, keeping any of those objects alive makes `destroy_pool`
+return `POOL_BUSY`.
 
 Release objects in dependency order:
 
 1. Finish all DMA and destroy read pins.
-2. Drop every resolved data-pool handle.
-3. Call `detach_pool(metadata)` for every worker attachment.
+2. Drop every independently retained metadata and data-pool handle.
+3. Call `detach_pool(attachment)` or `attachment.close()` for every worker.
 4. After a host-wide barrier, let the manager call
    `destroy_pool(descriptor)`.
 
@@ -124,15 +141,22 @@ the metadata/root objects last; a missing generation reports `NOT_FOUND`.
 
 ## Metadata and data handles
 
-The metadata directory describes the fixed children and versioned slot
-tenancies. Find a child and resolve its data handle before copying:
+The metadata directory describes every rank's fixed partitions and versioned
+slot tenancies. Use the registration paired with an eager local data handle for
+claims and DMA:
 
 ```python
-registered = metadata.find_pool("host-0")
-if registered is None:
-    raise RuntimeError("configured child is missing")
-pool = metadata.resolve_pool(registered.pool_ref)
+local = {
+    item.registration.name: item
+    for item in attachment.data_pools
+}
+registered = local[f"host-r{tp_rank}"].registration
+pool = local[f"host-r{tp_rank}"].data_pool
 ```
+
+Use `metadata.find_pool(name)` only when directory lookup itself is needed;
+the directory also contains registrations owned by other ranks, whose data
+arenas are intentionally not mapped by this attachment.
 
 Every slot is identified by a versioned `PoolRef`, `slot_id`, and
 `slot_version`. `metadata_version`, `pool_version`, and `slot_version` reject
@@ -215,6 +239,7 @@ SPYRE_DEVICES=0,1 bash run_test.sh \
   configs/distributed_tests/test_shared_metadata.yaml
 ```
 
-The metadata suite verifies cross-process claims, publication, peer reload,
-read-pin eviction blocking, slot reuse, and that a rank holding the only live
-attachment still makes destruction report `POOL_BUSY`.
+The metadata suite verifies cross-process claims, publication, global peer
+metadata visibility, rank-local DMA, read-pin eviction blocking, slot reuse,
+and that a rank holding the only live attachment still makes destruction
+report `POOL_BUSY`.

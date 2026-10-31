@@ -286,15 +286,20 @@ ownership and metadata protocols.
 
    Concrete KV-layout compatibility fields stored with each data child.
 
-.. class:: torch_spyre._C.SharedDataPoolConfig(name, backend, num_slots, slot_bytes, compatibility)
+.. class:: torch_spyre._C.SharedDataPartitionConfig(name, tp_rank, cache_index, num_slots, slot_bytes, offset_bytes=None)
 
-   Configuration for one fixed data child. ``PoolBackend.HOST_DRAM`` is the
-   currently supported backend.
+   Configuration for one rank-owned logical partition in an arena.
+
+.. class:: torch_spyre._C.SharedDataPoolConfig(name, backend, partitions, compatibility)
+
+   Configuration for one fixed data arena. All ``partitions`` in an arena must
+   have the same TP rank. ``PoolBackend.HOST_DRAM`` is the currently supported
+   backend.
 
 .. class:: torch_spyre._C.PoolConfig(name, metadata, data_pools)
 
    Configuration for the complete generation. ``metadata`` is a
-   ``MetadataConfig`` and ``data_pools`` is the complete child list created
+   ``MetadataConfig`` and ``data_pools`` is the complete arena list created
    before the generation becomes ready.
 
 .. class:: torch_spyre._C.PoolDescriptor
@@ -317,21 +322,36 @@ ownership and metadata protocols.
    .. staticmethod:: destroy_pool(descriptor) -> DestroyResult
 
       Destroy the descriptor's exact generation. Returns ``POOL_BUSY`` while
-      an attachment, resolved data child, or read pin retains the root lease.
+      an attachment, retained metadata or data-pool handle, or read pin retains
+      the root lease.
 
-   .. staticmethod:: attach_pool(name, expected_generation) -> AttachResult
+   .. staticmethod:: attach_pool(name, expected_generation, tp_rank) -> AttachResult
 
       Primary worker API. Open the named generation, verify the controller-provided
       16-byte generation token, and attach only if Flex's locked revalidation still
-      identifies that exact ready generation. This call never creates a pool.
+      identifies that exact ready generation. Success returns the global metadata
+      directory and every ready-to-use data-pool mapping for ``tp_rank``. This call
+      never creates a pool.
 
-   .. staticmethod:: attach_pool(descriptor) -> AttachResult
+   .. staticmethod:: attach_pool(descriptor, tp_rank) -> AttachResult
 
-      Compatibility overload that attaches using a complete descriptor.
+      Attach the requested rank using a complete descriptor.
 
-   .. staticmethod:: detach_pool(metadata) -> None
+   .. staticmethod:: detach_pool(attachment) -> None
 
-      Release one metadata attachment. Detach never unlinks the pool.
+      Close one ``PoolAttachment``. Detach never unlinks the pool and is
+      idempotent.
+
+.. class:: torch_spyre._C.PoolAttachment
+
+   Aggregate returned as ``AttachResult.attachment``. ``metadata`` is the global
+   directory, while ``data_pools`` contains ``AttachedDataPool`` entries for
+   exactly ``tp_rank``. ``close()`` releases the aggregate's ownership.
+
+.. class:: torch_spyre._C.AttachedDataPool
+
+   One rank-local ``registration`` and its already-mapped ``data_pool`` handle.
+   No follow-up resolution call is required.
 
 .. class:: torch_spyre._C.PoolResultCode
 
@@ -341,10 +361,10 @@ ownership and metadata protocols.
 
 .. class:: torch_spyre._C.SharedMetadata
 
-   Attached metadata directory. It supports ``find_pool``, ``resolve_pool``,
-   ``claim``, ``publish``, ``abort``, ``lookup``, ``pin_read``, and ``evict``.
-   Resolved ``SharedDataPool`` and ``SlotReadPin`` objects retain the root
-   lease independently of this Python wrapper.
+   Global attached metadata directory. It supports ``find_pool``, ``claim``,
+   ``publish``, ``abort``, ``lookup``, ``pin_read``, and ``evict``. Independently
+   retained metadata, ``SharedDataPool``, and ``SlotReadPin`` objects retain the
+   root lease after their aggregate attachment is closed.
 
 Profiler
 --------

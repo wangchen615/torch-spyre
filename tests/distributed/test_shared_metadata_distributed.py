@@ -34,6 +34,7 @@ from torch_spyre._C import PoolCompatibility
 from torch_spyre._C import PoolConfig
 from torch_spyre._C import PoolResultCode
 from torch_spyre._C import Reservation
+from torch_spyre._C import SharedDataPartitionConfig
 from torch_spyre._C import SharedDataPoolConfig
 from torch_spyre._C import SharedPool
 from torch_spyre._C import copy_tensor_raw
@@ -98,8 +99,16 @@ def destroy_pool_if_present(name):
 
 def make_config(name):
     compatibility = PoolCompatibility("distributed-test", "float16", 64, 2)
-    child = SharedDataPoolConfig("host-0", PoolBackend.HOST_DRAM, 2, 128, compatibility)
-    return PoolConfig(name, MetadataConfig(1), [child])
+    arenas = [
+        SharedDataPoolConfig(
+            f"arena-r{rank}",
+            PoolBackend.HOST_DRAM,
+            [SharedDataPartitionConfig(f"host-r{rank}", rank, 0, 2, 128, None)],
+            compatibility,
+        )
+        for rank in range(2)
+    ]
+    return PoolConfig(name, MetadataConfig(1), arenas)
 
 
 def destroy_generation_when_idle(descriptor, timeout_seconds=15):
@@ -190,12 +199,12 @@ class TestSharedMetadataCrossProcess(TestCase):
 
         state["dependents"].clear()
         state["pool"] = None
-        attached = state.get("attached")
-        if attached is not None and attached.metadata is not None:
+        attachment = state.get("attached")
+        if attachment is not None:
             try:
-                SharedPool.detach_pool(attached.metadata)
+                SharedPool.detach_pool(attachment)
             except Exception as error:
-                cleanup_errors.append(f"metadata detach failed: {error}")
+                cleanup_errors.append(f"attachment close failed: {error}")
         state["metadata"] = None
         state["attached"] = None
         gc.collect()
@@ -249,19 +258,26 @@ class TestSharedMetadataCrossProcess(TestCase):
         dist.broadcast_object_list(descriptor_box, src=0)
         descriptor = descriptor_box[0]
         state["descriptor"] = descriptor
-        attached = SharedPool.attach_pool(descriptor)
-        state["attached"] = attached
-        self.assertIs(attached.code, PoolResultCode.OK)
-        self.assertIsNotNone(attached.metadata)
-        md = attached.metadata
+        result = SharedPool.attach_pool(descriptor, self.comm_rank)
+        self.assertIs(result.code, PoolResultCode.OK)
+        attachment = result.attachment
+        state["attached"] = attachment
+        self.assertEqual(attachment.tp_rank, self.comm_rank)
+        entries = attachment.data_pools
+        self.assertEqual(
+            [item.registration.name for item in entries],
+            [f"host-r{self.comm_rank}"],
+        )
+        md = attachment.metadata
         state["metadata"] = md
-        registered = md.find_pool("host-0")
-        self.assertIsNotNone(registered)
-        pool = md.resolve_pool(registered.pool_ref)
+        self.assertEqual(md.pool_count(), 2)
+        registered = entries[0].registration
+        pool = entries[0].data_pool
+        entries.clear()
         state["pool"] = pool
         self.assertIsNotNone(pool)
-        if os.getenv("TORCH_SPYRE_SHARED_METADATA_FAIL_AFTER_RESOLVE") == "1":
-            raise RuntimeError("injected failure after data-pool resolution")
+        if os.getenv("TORCH_SPYRE_SHARED_METADATA_FAIL_AFTER_ATTACH") == "1":
+            raise RuntimeError("injected failure after eager attachment")
 
         for operation in range(4):
             dist.barrier()  # start both distinct-key offloads together
@@ -277,14 +293,28 @@ class TestSharedMetadataCrossProcess(TestCase):
 
             peer = 1 - self.comm_rank
             peer_key = block_key(registered.compatibility, peer, operation)
-            self.reload(md, pool, peer_key, peer, operation)
-            dist.barrier()  # both peer reload pins are released
+            peer_entry = md.lookup(peer_key)
+            self.assertIsNotNone(peer_entry)
+            state["dependents"].append(peer_entry)
+            self.assertNotEqual(
+                peer_entry.slot.pool.pool_id,
+                registered.pool_ref.pool_id,
+            )
+            self.reload(
+                md,
+                pool,
+                own_key,
+                self.comm_rank,
+                operation,
+            )
+            dist.barrier()  # both local reload pins are released
 
             own_entry = md.lookup(own_key)
             self.assertIsNotNone(own_entry)
             state["dependents"].append(own_entry)
             self.assertEqual(own_entry.slot.slot_id, own_slot.slot_id)
             self.assertTrue(md.evict(own_entry))
+            del peer_entry
             dist.barrier()  # both slots are free for the next round
 
         same_key = CompatibleBlockKey(registered.compatibility, 0x7F00)
@@ -310,7 +340,14 @@ class TestSharedMetadataCrossProcess(TestCase):
             self.publish_reserved(md, pool, claim, winner, operation=16)
         dist.barrier()  # the winning page is published
 
-        entry = self.reload(md, pool, same_key, winner, operation=16)
+        entry = md.lookup(same_key)
+        self.assertIsNotNone(entry)
+        if self.comm_rank == winner:
+            self.reload(md, pool, same_key, winner, operation=16)
+        else:
+            observed_pin = md.pin_read(entry)
+            self.assertIsNotNone(observed_pin)
+            del observed_pin
         state["dependents"].append(entry)
         self.assertEqual(entry.slot.pool.pool_id, observed_slot.pool.pool_id)
         self.assertEqual(entry.slot.slot_id, observed_slot.slot_id)
@@ -374,24 +411,22 @@ class TestSharedMetadataCrossProcess(TestCase):
             )
             self.assertFalse(finished.is_set())
         else:
-            destination = torch.empty(
-                PAGE_ELEMENTS,
-                device=DEVICE,
-                dtype=torch.float16,
+            self.assertNotEqual(
+                protected_entry.slot.pool.pool_id,
+                registered.pool_ref.pool_id,
             )
-            copy_tensor_raw(
-                destination,
-                pool,
-                protected_entry.slot.slot_id,
-                to_device=True,
-            )
-            self.assertEqual(expected_page(0, 32), destination.cpu())
 
-        dist.barrier()  # protected reload and unrelated publish completed
+        dist.barrier()  # protected observation and unrelated publish completed
         if self.comm_rank == 0:
             self.assertFalse(finished.is_set())
         else:
-            self.reload(md, pool, unrelated_key, owner=0, operation=33)
+            unrelated_entry = md.lookup(unrelated_key)
+            self.assertIsNotNone(unrelated_entry)
+            self.assertNotEqual(
+                unrelated_entry.slot.pool.pool_id,
+                registered.pool_ref.pool_id,
+            )
+            state["dependents"].append(unrelated_entry)
         dist.barrier()  # rank 1 still holds the protected pin
 
         if self.comm_rank == 1:
@@ -442,9 +477,17 @@ class TestSharedMetadataCrossProcess(TestCase):
             )
         dist.barrier()  # replacement is visible
 
-        if self.comm_rank == 1:
+        if self.comm_rank == 0:
             self.reload(md, pool, replacement_key, owner=0, operation=34)
-        dist.barrier()  # all DMA and pins are complete
+        else:
+            replacement_entry = md.lookup(replacement_key)
+            self.assertIsNotNone(replacement_entry)
+            self.assertNotEqual(
+                replacement_entry.slot.pool.pool_id,
+                registered.pool_ref.pool_id,
+            )
+            state["dependents"].append(replacement_entry)
+        dist.barrier()  # local DMA and peer metadata observation are complete
 
         del own_entry
         del protected_entry
@@ -457,9 +500,11 @@ class TestSharedMetadataCrossProcess(TestCase):
         if self.comm_rank == 0:
             state["pool"] = None
             pool = None
-            SharedPool.detach_pool(attached.metadata)
             state["metadata"] = None
+            md = None
+            SharedPool.detach_pool(attachment)
             state["attached"] = None
+            attachment = None
         dist.barrier()  # rank 1 deliberately retains both handles
 
         if self.comm_rank == 0:
@@ -470,9 +515,11 @@ class TestSharedMetadataCrossProcess(TestCase):
         if self.comm_rank == 1:
             state["pool"] = None
             pool = None
-            SharedPool.detach_pool(attached.metadata)
             state["metadata"] = None
+            md = None
+            SharedPool.detach_pool(attachment)
             state["attached"] = None
+            attachment = None
         dist.barrier()
 
         if self.comm_rank == 0:

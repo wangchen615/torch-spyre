@@ -32,43 +32,46 @@ from torch_spyre._C import SharedDataPoolConfig
 from torch_spyre._C import copy_tensor_raw
 
 
-def test_resolved_host_pool_geometry_and_name():
-    """Resolution must return the configured logical child and geometry."""
+def test_attached_host_pool_geometry_and_name():
+    """Eager attachment must return the configured child and geometry."""
     name = unique_pool_name("host-geometry")
     created = SharedPool.create_pool(make_pool_config(name, num_slots=5, slot_bytes=5))
     assert created.code is PoolResultCode.OK
-    attached = SharedPool.attach_pool(created.descriptor)
+    attached = SharedPool.attach_pool(created.descriptor, 0)
     assert attached.code is PoolResultCode.OK
+    attachment = attached.attachment
+    entry = None
     pool = None
     try:
-        registered = attached.metadata.find_pool("host-0")
-        assert registered is not None
-        pool = attached.metadata.resolve_pool(registered.pool_ref)
+        entry = attachment.data_pools[0]
+        assert entry.registration.name == "host-0"
+        pool = entry.data_pool
 
         assert pool.name() == "host-0"
         assert pool.slot_count() == 5
         assert pool.slot_bytes() >= 5
         assert pool.total_bytes() == pool.slot_count() * pool.slot_bytes()
+        assert not hasattr(attachment.metadata, "resolve_pool")
     finally:
         del pool
-        SharedPool.detach_pool(attached.metadata)
+        del entry
+        SharedPool.detach_pool(attachment)
         destroy_pool_if_present(name)
 
 
-def test_resolved_host_pool_preserves_data_pool_hierarchy():
+def test_attached_host_pool_preserves_data_pool_hierarchy():
     """A host child must remain usable through the shared-data base API."""
     name = unique_pool_name("host-hierarchy")
     created = SharedPool.create_pool(
         make_pool_config(name, num_slots=2, slot_bytes=128)
     )
     assert created.code is PoolResultCode.OK
-    attached = SharedPool.attach_pool(created.descriptor)
+    attached = SharedPool.attach_pool(created.descriptor, 0)
     assert attached.code is PoolResultCode.OK
+    attachment = attached.attachment
     pool = None
     try:
-        registered = attached.metadata.find_pool("host-0")
-        assert registered is not None
-        pool = attached.metadata.resolve_pool(registered.pool_ref)
+        pool = attachment.data_pools[0].data_pool
 
         assert isinstance(pool, SharedHostPool)
         assert isinstance(pool, SharedDataPool)
@@ -77,7 +80,7 @@ def test_resolved_host_pool_preserves_data_pool_hierarchy():
         assert not hasattr(pool, "unlink_by_name")
     finally:
         del pool
-        SharedPool.detach_pool(attached.metadata)
+        SharedPool.detach_pool(attachment)
         destroy_pool_if_present(name)
 
 
@@ -102,14 +105,15 @@ def test_partition_views_write_distinct_arena_offsets():
     )
     created = SharedPool.create_pool(config)
     assert created.code is PoolResultCode.OK
-    attached = SharedPool.attach_pool(created.descriptor)
+    attached = SharedPool.attach_pool(created.descriptor, 0)
     assert attached.code is PoolResultCode.OK
+    attachment = attached.attachment
+    entries = attachment.data_pools
+    by_name = {}
     pools = []
     try:
-        for partition_name in ("host-r0-c0", "host-r0-c1"):
-            registered = attached.metadata.find_pool(partition_name)
-            assert registered is not None
-            pools.append(attached.metadata.resolve_pool(registered.pool_ref))
+        by_name = {entry.registration.name: entry.data_pool for entry in entries}
+        pools = [by_name["host-r0-c0"], by_name["host-r0-c1"]]
         assert pools[0].name() != pools[1].name()
 
         first = torch.arange(64, device="spyre", dtype=torch.float16)
@@ -124,5 +128,7 @@ def test_partition_views_write_distinct_arena_offsets():
         assert torch.equal(second_result.cpu(), second.cpu())
     finally:
         pools.clear()
-        SharedPool.detach_pool(attached.metadata)
+        by_name.clear()
+        entries.clear()
+        SharedPool.detach_pool(attachment)
         destroy_pool_if_present(name)

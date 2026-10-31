@@ -32,10 +32,90 @@ from torch_spyre._C import PoolConfig
 from torch_spyre._C import MetadataConfig
 from torch_spyre._C import SharedDataPartitionConfig
 from torch_spyre._C import SharedDataPoolConfig
+from torch_spyre._C import SharedHostPool
 from torch_spyre._C import SharedPool
 from torch_spyre._C import _decode_pool_config_state
 from torch_spyre._C import _decode_pool_descriptor_state
 from torch_spyre._C import _decode_reservation_token_state
+
+
+def make_two_rank_config(name: str) -> PoolConfig:
+    """Build two rank-homogeneous arenas under one metadata directory."""
+    compatibility = PoolCompatibility("test-model", "float16", 16, 2)
+    rank0 = SharedDataPoolConfig(
+        "host-r0",
+        PoolBackend.HOST_DRAM,
+        [
+            SharedDataPartitionConfig("host-r0-c0", 0, 0, 2, 128, None),
+            SharedDataPartitionConfig("host-r0-c1", 0, 1, 2, 128, None),
+        ],
+        compatibility,
+    )
+    rank1 = SharedDataPoolConfig(
+        "host-r1",
+        PoolBackend.HOST_DRAM,
+        [SharedDataPartitionConfig("host-r1-c0", 1, 0, 2, 128, None)],
+        compatibility,
+    )
+    return PoolConfig(name, MetadataConfig(1), [rank0, rank1])
+
+
+def test_attach_returns_only_ready_requested_rank_handles():
+    """Dropping rank filtering or eager handles must fail this test."""
+    name = unique_pool_name("ranked-attach")
+    created = SharedPool.create_pool(make_two_rank_config(name))
+    assert created.code is PoolResultCode.OK
+    attachment = None
+    try:
+        result = SharedPool.attach_pool(created.descriptor, 1)
+
+        assert result.code is PoolResultCode.OK
+        assert result.attachment is not None
+        attachment = result.attachment
+        assert attachment.tp_rank == 1
+        assert attachment.metadata.pool_count() == 3
+        assert [item.registration.name for item in attachment.data_pools] == [
+            "host-r1-c0"
+        ]
+        assert isinstance(attachment.data_pools[0].data_pool, SharedHostPool)
+    finally:
+        SharedPool.detach_pool(attachment)
+        destroy_pool_if_present(name)
+
+
+def test_attach_rejects_unconfigured_rank_without_partial_attachment():
+    """Accepting an absent TP rank must fail with no usable aggregate."""
+    name = unique_pool_name("unknown-rank")
+    created = SharedPool.create_pool(make_two_rank_config(name))
+    assert created.code is PoolResultCode.OK
+    try:
+        result = SharedPool.attach_pool(created.descriptor, 2)
+
+        assert result.code is PoolResultCode.CONFIGURATION_MISMATCH
+        assert result.attachment is None
+    finally:
+        destroy_pool_if_present(name)
+
+
+def test_close_invalidates_every_pool_attachment_alias():
+    """Closing either Python alias must close their shared aggregate state."""
+    name = unique_pool_name("attachment-alias")
+    created = SharedPool.create_pool(make_pool_config(name))
+    assert created.code is PoolResultCode.OK
+    result = SharedPool.attach_pool(created.descriptor, 0)
+    assert result.code is PoolResultCode.OK
+    first = result.attachment
+    second = result.attachment
+    try:
+        first.close()
+
+        with pytest.raises(RuntimeError, match="closed"):
+            _ = second.metadata
+        second.close()
+        assert SharedPool.destroy_pool(created.descriptor).code is PoolResultCode.OK
+    finally:
+        SharedPool.detach_pool(second)
+        destroy_pool_if_present(name)
 
 
 def test_create_open_destroy_persistent_generation():
@@ -91,9 +171,11 @@ def test_partitioned_descriptor_and_config_pickle_round_trip():
     compatibility = PoolCompatibility(
         "test-model", "float16", 16, 2, "layout-signature"
     )
-    partitions = [
+    rank0_partitions = [
         SharedDataPartitionConfig("host-r0-c0", 0, 0, 4, 128, None),
         SharedDataPartitionConfig("host-r0-c1", 0, 1, 4, 4097, None),
+    ]
+    rank1_partitions = [
         SharedDataPartitionConfig("host-r1-c0", 1, 0, 4, 8192, None),
     ]
     config = PoolConfig(
@@ -101,8 +183,11 @@ def test_partitioned_descriptor_and_config_pickle_round_trip():
         MetadataConfig(2),
         [
             SharedDataPoolConfig(
-                "host-0", PoolBackend.HOST_DRAM, partitions, compatibility
-            )
+                "host-r0", PoolBackend.HOST_DRAM, rank0_partitions, compatibility
+            ),
+            SharedDataPoolConfig(
+                "host-r1", PoolBackend.HOST_DRAM, rank1_partitions, compatibility
+            ),
         ],
     )
     try:
@@ -117,7 +202,11 @@ def test_partitioned_descriptor_and_config_pickle_round_trip():
             restored.effective_config.data_pools[0].compatibility.layout_signature
             == "layout-signature"
         )
-        effective = restored.effective_config.data_pools[0].partitions
+        effective = [
+            partition
+            for arena in restored.effective_config.data_pools
+            for partition in arena.partitions
+        ]
         assert [partition.name for partition in effective] == [
             "host-r0-c0",
             "host-r0-c1",
@@ -134,17 +223,22 @@ def test_partitioned_metadata_survives_the_last_detach():
     """Zero attachments must preserve partition records and published entries."""
     name = unique_pool_name("partition-persistent")
     compatibility = PoolCompatibility("test-model", "float16", 16, 2)
-    partitions = [
-        SharedDataPartitionConfig("host-r0-c0", 0, 0, 4, 128, None),
-        SharedDataPartitionConfig("host-r1-c0", 1, 0, 4, 4097, None),
-    ]
     config = PoolConfig(
         name,
         MetadataConfig(2),
         [
             SharedDataPoolConfig(
-                "host-0", PoolBackend.HOST_DRAM, partitions, compatibility
-            )
+                "host-r0",
+                PoolBackend.HOST_DRAM,
+                [SharedDataPartitionConfig("host-r0-c0", 0, 0, 4, 128, None)],
+                compatibility,
+            ),
+            SharedDataPoolConfig(
+                "host-r1",
+                PoolBackend.HOST_DRAM,
+                [SharedDataPartitionConfig("host-r1-c0", 1, 0, 4, 4097, None)],
+                compatibility,
+            ),
         ],
     )
     first = None
@@ -152,27 +246,31 @@ def test_partitioned_metadata_survives_the_last_detach():
     try:
         created = SharedPool.create_pool(config)
         assert created.code is PoolResultCode.OK
-        first_result = SharedPool.attach_pool(created.descriptor)
+        first_result = SharedPool.attach_pool(created.descriptor, 1)
         assert first_result.code is PoolResultCode.OK
-        first = first_result.metadata
-        registered = first.find_pool("host-r1-c0")
+        first = first_result.attachment
+        metadata = first.metadata
+        registered = metadata.find_pool("host-r1-c0")
         key = CompatibleBlockKey(registered.compatibility, 0x4455)
-        reservation = first.claim(registered.pool_ref, key)
-        first.publish(reservation, [ChunkDescriptorEntry(1, 4097)])
+        reservation = metadata.claim(registered.pool_ref, key)
+        metadata.publish(reservation, [ChunkDescriptorEntry(1, 4097)])
+        metadata = None
         SharedPool.detach_pool(first)
         first = None
 
         opened = SharedPool.open_pool(name)
         assert opened.code is PoolResultCode.OK
         assert opened.descriptor == created.descriptor
-        second_result = SharedPool.attach_pool(opened.descriptor)
+        second_result = SharedPool.attach_pool(opened.descriptor, 1)
         assert second_result.code is PoolResultCode.OK
-        second = second_result.metadata
-        restored = second.find_pool("host-r1-c0")
+        second = second_result.attachment
+        metadata = second.metadata
+        restored = metadata.find_pool("host-r1-c0")
         assert restored.pool_ref == registered.pool_ref
-        entry = second.lookup(CompatibleBlockKey(restored.compatibility, 0x4455))
+        entry = metadata.lookup(CompatibleBlockKey(restored.compatibility, 0x4455))
         assert entry is not None
         assert [(chunk.domain_id, chunk.size) for chunk in entry.chunks] == [(1, 4097)]
+        metadata = None
         SharedPool.detach_pool(second)
         second = None
 
@@ -343,39 +441,43 @@ def test_pool_descriptor_rejects_malformed_pickle_state():
         _decode_pool_descriptor_state(malformed_state)
 
 
-def test_detach_invalidates_all_metadata_aliases():
-    """One explicit detach must invalidate every alias of the attachment."""
-    name = unique_pool_name("alias-detach")
+def test_retained_metadata_keeps_generation_busy_after_attachment_close():
+    """Closing the aggregate must not invalidate a retained metadata handle."""
+    name = unique_pool_name("metadata-lease")
     created = SharedPool.create_pool(make_pool_config(name))
     assert created.code is PoolResultCode.OK
-    attached = SharedPool.attach_pool(created.descriptor)
+    attached = SharedPool.attach_pool(created.descriptor, 0)
     assert attached.code is PoolResultCode.OK
-    first = attached.metadata
-    second = attached.metadata
+    attachment = attached.attachment
+    metadata = attachment.metadata
     try:
-        SharedPool.detach_pool(first)
+        SharedPool.detach_pool(attachment)
 
-        with pytest.raises(RuntimeError, match="detached"):
-            second.pool_count()
+        assert metadata.pool_count() == 1
+        assert (
+            SharedPool.destroy_pool(created.descriptor).code is PoolResultCode.POOL_BUSY
+        )
 
+        del metadata
         assert SharedPool.destroy_pool(created.descriptor).code is PoolResultCode.OK
     finally:
-        SharedPool.detach_pool(second)
+        SharedPool.detach_pool(attachment)
         destroy_pool_if_present(name)
 
 
-def test_resolved_pool_keeps_generation_busy_after_metadata_detach():
-    """A resolved child must retain its independent root lifecycle lease."""
-    name = unique_pool_name("resolved-lease")
+def test_attached_pool_keeps_generation_busy_after_attachment_close():
+    """A retained eager data handle must keep its root lifecycle lease."""
+    name = unique_pool_name("data-lease")
     created = SharedPool.create_pool(make_pool_config(name))
     assert created.code is PoolResultCode.OK
-    attached = SharedPool.attach_pool(created.descriptor)
+    attached = SharedPool.attach_pool(created.descriptor, 0)
     assert attached.code is PoolResultCode.OK
-    registered = attached.metadata.find_pool("host-0")
-    assert registered is not None
-    data = attached.metadata.resolve_pool(registered.pool_ref)
+    attachment = attached.attachment
+    entry = attachment.data_pools[0]
+    data = entry.data_pool
+    del entry
     try:
-        SharedPool.detach_pool(attached.metadata)
+        SharedPool.detach_pool(attachment)
         assert (
             SharedPool.destroy_pool(created.descriptor).code is PoolResultCode.POOL_BUSY
         )
@@ -383,12 +485,12 @@ def test_resolved_pool_keeps_generation_busy_after_metadata_detach():
         del data
         assert SharedPool.destroy_pool(created.descriptor).code is PoolResultCode.OK
     finally:
-        SharedPool.detach_pool(attached.metadata)
+        SharedPool.detach_pool(attachment)
         destroy_pool_if_present(name)
 
 
-def test_attach_result_metadata_is_none_on_stale_generation():
-    """A stale capability must not expose replacement-generation metadata."""
+def test_attach_result_attachment_is_none_on_stale_generation():
+    """A stale capability must not expose a replacement-generation attachment."""
     name = unique_pool_name("stale-attach")
     config = make_pool_config(name)
     first = SharedPool.create_pool(config)
@@ -397,10 +499,10 @@ def test_attach_result_metadata_is_none_on_stale_generation():
     replacement = SharedPool.create_pool(config)
     assert replacement.code is PoolResultCode.OK
     try:
-        stale = SharedPool.attach_pool(first.descriptor)
+        stale = SharedPool.attach_pool(first.descriptor, 0)
 
         assert stale.code is PoolResultCode.STALE_GENERATION
-        assert stale.metadata is None
+        assert stale.attachment is None
     finally:
         destroy_pool_if_present(name)
 
@@ -414,11 +516,12 @@ def test_attach_by_identity_is_primary_worker_flow():
         attached = SharedPool.attach_pool(
             created.descriptor.name,
             created.descriptor.generation.bytes,
+            0,
         )
 
         assert attached.code is PoolResultCode.OK
-        assert attached.metadata is not None
-        SharedPool.detach_pool(attached.metadata)
+        assert attached.attachment is not None
+        SharedPool.detach_pool(attached.attachment)
     finally:
         destroy_pool_if_present(name)
 
@@ -434,10 +537,11 @@ def test_attach_by_identity_attests_expected_effective_config():
             name,
             created.descriptor.generation.bytes,
             incompatible,
+            0,
         )
 
         assert attached.code is PoolResultCode.CONFIGURATION_MISMATCH
-        assert attached.metadata is None
+        assert attached.attachment is None
     finally:
         destroy_pool_if_present(name)
 
@@ -446,10 +550,10 @@ def test_attach_by_identity_reports_missing_pool():
     """Identity attach must report absence rather than create a pool."""
     name = unique_pool_name("missing-attach")
 
-    attached = SharedPool.attach_pool(name, bytes(16))
+    attached = SharedPool.attach_pool(name, bytes(16), 0)
 
     assert attached.code is PoolResultCode.NOT_FOUND
-    assert attached.metadata is None
+    assert attached.attachment is None
 
 
 def test_attach_by_identity_rejects_replacement_generation():
@@ -462,10 +566,10 @@ def test_attach_by_identity_rejects_replacement_generation():
     replacement = SharedPool.create_pool(config)
     assert replacement.code is PoolResultCode.OK
     try:
-        attached = SharedPool.attach_pool(name, first.descriptor.generation.bytes)
+        attached = SharedPool.attach_pool(name, first.descriptor.generation.bytes, 0)
 
         assert attached.code is PoolResultCode.STALE_GENERATION
-        assert attached.metadata is None
+        assert attached.attachment is None
     finally:
         destroy_pool_if_present(name)
 
@@ -474,7 +578,7 @@ def test_attach_by_identity_rejects_replacement_generation():
 def test_attach_by_identity_rejects_malformed_generation(generation):
     """Generation length must be rejected before the pool is opened."""
     with pytest.raises(ValueError, match="16 bytes"):
-        SharedPool.attach_pool(unique_pool_name("malformed-attach"), generation)
+        SharedPool.attach_pool(unique_pool_name("malformed-attach"), generation, 0)
 
 
 def test_detach_is_idempotent():
@@ -482,13 +586,13 @@ def test_detach_is_idempotent():
     name = unique_pool_name("idempotent-detach")
     created = SharedPool.create_pool(make_pool_config(name))
     assert created.code is PoolResultCode.OK
-    attached = SharedPool.attach_pool(created.descriptor)
+    attached = SharedPool.attach_pool(created.descriptor, 0)
     assert attached.code is PoolResultCode.OK
     try:
-        SharedPool.detach_pool(attached.metadata)
-        SharedPool.detach_pool(attached.metadata)
+        SharedPool.detach_pool(attached.attachment)
+        SharedPool.detach_pool(attached.attachment)
 
         assert SharedPool.destroy_pool(created.descriptor).code is PoolResultCode.OK
     finally:
-        SharedPool.detach_pool(attached.metadata)
+        SharedPool.detach_pool(attached.attachment)
         destroy_pool_if_present(name)

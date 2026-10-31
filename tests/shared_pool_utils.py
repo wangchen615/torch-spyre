@@ -59,7 +59,7 @@ def destroy_pool_if_present(name: str) -> None:
 
 
 class LifecyclePool:
-    """Own one test attachment and its resolved host child."""
+    """Own one test attachment and its eagerly attached host child."""
 
     def __init__(self, label: str, *, num_slots: int, slot_bytes: int) -> None:
         self.name = unique_pool_name(label)
@@ -73,23 +73,30 @@ class LifecyclePool:
         if self.created.code is not PoolResultCode.OK:
             raise RuntimeError(f"failed to create {self.name}: {self.created.detail}")
 
-        attached = SharedPool.attach_pool(self.created.descriptor)
-        if attached.code is not PoolResultCode.OK or attached.metadata is None:
+        attached = SharedPool.attach_pool(self.created.descriptor, 0)
+        if attached.code is not PoolResultCode.OK or attached.attachment is None:
             SharedPool.destroy_pool(self.created.descriptor)
             raise RuntimeError(f"failed to attach {self.name}: {attached.detail}")
-        self.metadata = attached.metadata
-        registered = self.metadata.find_pool("host-0")
-        if registered is None:
-            SharedPool.detach_pool(self.metadata)
+        self.attachment = attached.attachment
+        self.metadata = self.attachment.metadata
+        by_name = {item.registration.name: item for item in self.attachment.data_pools}
+        entry = by_name.get("host-0")
+        if entry is None:
+            SharedPool.detach_pool(self.attachment)
             SharedPool.destroy_pool(self.created.descriptor)
             raise RuntimeError(f"host-0 is missing from {self.name}")
-        self._pool: SharedDataPool | None = self.metadata.resolve_pool(
-            registered.pool_ref
-        )
+        if entry.registration.slot_count != num_slots:
+            SharedPool.detach_pool(self.attachment)
+            SharedPool.destroy_pool(self.created.descriptor)
+            raise RuntimeError(f"host-0 has unexpected geometry in {self.name}")
+        self._pool: SharedDataPool | None = entry.data_pool
+        if self._pool.slot_count() != num_slots:
+            self.close()
+            raise RuntimeError(f"host-0 mapping has unexpected geometry in {self.name}")
 
     @property
     def pool(self) -> SharedDataPool:
-        """Return the resolved child while this lifecycle owner is attached."""
+        """Return the eager child while this lifecycle owner is attached."""
         if self._pool is None:
             raise RuntimeError(f"pool {self.name} is closed")
         return self._pool
@@ -98,7 +105,8 @@ class LifecyclePool:
         """Release child and metadata leases before destroying the generation."""
         if self._pool is not None:
             self._pool = None
-            SharedPool.detach_pool(self.metadata)
+            del self.metadata
+            SharedPool.detach_pool(self.attachment)
         destroyed = SharedPool.destroy_pool(self.created.descriptor)
         if destroyed.code not in (PoolResultCode.OK, PoolResultCode.NOT_FOUND):
             raise RuntimeError(

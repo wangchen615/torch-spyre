@@ -27,6 +27,7 @@ from torch_spyre._C import PoolBackend
 from torch_spyre._C import PoolCompatibility
 from torch_spyre._C import PoolConfig
 from torch_spyre._C import PoolResultCode
+from torch_spyre._C import SharedDataPartitionConfig
 from torch_spyre._C import SharedDataPoolConfig
 from torch_spyre._C import SharedPool
 from torch_spyre._C import copy_tensor_raw
@@ -53,10 +54,16 @@ def destroy_pool_if_present(name):
 
 def make_config(name, slot_bytes):
     compatibility = PoolCompatibility("distributed-test", "float16", 64, 2)
-    child = SharedDataPoolConfig(
-        "host-0", PoolBackend.HOST_DRAM, 1, slot_bytes, compatibility
-    )
-    return PoolConfig(name, MetadataConfig(1), [child])
+    arenas = [
+        SharedDataPoolConfig(
+            f"arena-r{rank}",
+            PoolBackend.HOST_DRAM,
+            [SharedDataPartitionConfig(f"host-r{rank}", rank, 0, 1, slot_bytes)],
+            compatibility,
+        )
+        for rank in range(2)
+    ]
+    return PoolConfig(name, MetadataConfig(1), arenas)
 
 
 class TestKVOffloadCrossProcess(TestCase):
@@ -78,7 +85,7 @@ class TestKVOffloadCrossProcess(TestCase):
         slot_bytes = get_composite_address(expected).total_size
         name = f"torch-spyre-dist-kv-{self.id()}"
         descriptor_box = [None]
-        attached = None
+        attachment = None
         pool = None
         descriptor = None
         try:
@@ -93,24 +100,29 @@ class TestKVOffloadCrossProcess(TestCase):
 
             dist.broadcast_object_list(descriptor_box, src=0)
             descriptor = descriptor_box[0]
-            attached = SharedPool.attach_pool(descriptor)
-            self.assertIs(attached.code, PoolResultCode.OK)
-            registered = attached.metadata.find_pool("host-0")
-            pool = attached.metadata.resolve_pool(registered.pool_ref)
+            result = SharedPool.attach_pool(descriptor, self.comm_rank)
+            self.assertIs(result.code, PoolResultCode.OK)
+            attachment = result.attachment
+            self.assertEqual(attachment.tp_rank, self.comm_rank)
+            entries = attachment.data_pools
+            self.assertEqual(
+                [item.registration.name for item in entries],
+                [f"host-r{self.comm_rank}"],
+            )
+            pool = entries[0].data_pool
+            entries.clear()
 
-            if self.comm_rank == 0:
-                copy_tensor_raw(expected, pool, 0, to_device=False)
+            copy_tensor_raw(expected, pool, 0, to_device=False)
             dist.barrier()
 
-            if self.comm_rank == 1:
-                reloaded = torch.empty_like(expected)
-                copy_tensor_raw(reloaded, pool, 0, to_device=True)
-                self.assertEqual(expected.cpu(), reloaded.cpu())
+            reloaded = torch.empty_like(expected)
+            copy_tensor_raw(reloaded, pool, 0, to_device=True)
+            self.assertEqual(expected.cpu(), reloaded.cpu())
             dist.barrier()
         finally:
             pool = None
-            if attached is not None:
-                SharedPool.detach_pool(attached.metadata)
+            if attachment is not None:
+                SharedPool.detach_pool(attachment)
             if dist.is_initialized():
                 dist.barrier()
             if self.comm_rank == 0 and descriptor is not None:

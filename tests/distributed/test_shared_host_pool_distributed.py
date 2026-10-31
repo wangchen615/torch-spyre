@@ -26,6 +26,7 @@ from torch_spyre._C import PoolBackend
 from torch_spyre._C import PoolCompatibility
 from torch_spyre._C import PoolConfig
 from torch_spyre._C import PoolResultCode
+from torch_spyre._C import SharedDataPartitionConfig
 from torch_spyre._C import SharedDataPoolConfig
 from torch_spyre._C import SharedPool
 
@@ -52,14 +53,20 @@ def make_config(name, num_slots, slot_bytes, tensor_parallel_size):
     compatibility = PoolCompatibility(
         "distributed-test", "float16", 64, tensor_parallel_size
     )
-    child = SharedDataPoolConfig(
-        "host-0",
-        PoolBackend.HOST_DRAM,
-        num_slots,
-        slot_bytes,
-        compatibility,
-    )
-    return PoolConfig(name, MetadataConfig(1), [child])
+    arenas = [
+        SharedDataPoolConfig(
+            f"arena-r{rank}",
+            PoolBackend.HOST_DRAM,
+            [
+                SharedDataPartitionConfig(
+                    f"host-r{rank}", rank, 0, num_slots, slot_bytes, None
+                )
+            ],
+            compatibility,
+        )
+        for rank in range(tensor_parallel_size)
+    ]
+    return PoolConfig(name, MetadataConfig(1), arenas)
 
 
 class TestSharedHostPoolCrossProcess(TestCase):
@@ -79,7 +86,8 @@ class TestSharedHostPoolCrossProcess(TestCase):
     def test_cross_process_shared_pool(self):
         name = f"torch-spyre-dist-host-{self.id()}"
         identity_box = [None]
-        attached = None
+        attachment = None
+        metadata = None
         pool = None
         descriptor = None
         try:
@@ -100,20 +108,30 @@ class TestSharedHostPoolCrossProcess(TestCase):
 
             dist.broadcast_object_list(identity_box, src=0)
             pool_name, generation = identity_box[0]
-            attached = SharedPool.attach_pool(pool_name, generation)
-            self.assertIs(attached.code, PoolResultCode.OK)
-            registered = attached.metadata.find_pool("host-0")
-            self.assertIsNotNone(registered)
-            pool = attached.metadata.resolve_pool(registered.pool_ref)
+            result = SharedPool.attach_pool(pool_name, generation, self.comm_rank)
+            self.assertIs(result.code, PoolResultCode.OK)
+            attachment = result.attachment
+            self.assertEqual(attachment.tp_rank, self.comm_rank)
+            entries = attachment.data_pools
+            expected_name = f"host-r{self.comm_rank}"
+            self.assertEqual(
+                [item.registration.name for item in entries],
+                [expected_name],
+            )
+            metadata = attachment.metadata
+            self.assertEqual(metadata.pool_count(), dist.get_world_size())
+            pool = entries[0].data_pool
+            entries.clear()
 
             self.assertEqual(pool.slot_count(), 1)
-            self.assertEqual(pool.name(), "host-0")
+            self.assertEqual(pool.name(), expected_name)
             self.assertEqual(pool.total_bytes(), pool.slot_count() * pool.slot_bytes())
             dist.barrier()
         finally:
             pool = None
-            if attached is not None:
-                SharedPool.detach_pool(attached.metadata)
+            metadata = None
+            if attachment is not None:
+                SharedPool.detach_pool(attachment)
             if dist.is_initialized():
                 dist.barrier()
             if self.comm_rank == 0 and descriptor is not None:
