@@ -274,6 +274,105 @@ standard accelerator memory API is available against Spyre devices:
 
 A worked example is in :doc:`../user_guide/profiling/index`.
 
+Persistent Shared KV Pools
+--------------------------
+
+The low-level ``torch_spyre._C`` module exposes one lifecycle for a composite,
+node-local KV pool. A pool contains a shared metadata directory and a fixed
+list of data children. See :doc:`../runtime/shared_metadata` for the complete
+ownership and metadata protocols.
+
+.. class:: torch_spyre._C.PoolCompatibility(model, kv_dtype, block_size, tensor_parallel_size)
+
+   Concrete KV-layout compatibility fields stored with each data child.
+
+.. class:: torch_spyre._C.SharedDataPartitionConfig(name, tp_rank, cache_index, num_slots, slot_bytes, offset_bytes=None)
+
+   Configuration for one rank-owned logical partition in an arena.
+
+.. class:: torch_spyre._C.SharedDataPoolConfig(name, backend, partitions, compatibility, *, marvell=None)
+
+   Configuration for one fixed data arena. All ``partitions`` in an arena must
+   have the same TP rank. ``backend`` is ``PoolBackend.HOST_DRAM`` or
+   ``PoolBackend.MARVELL``; ``marvell`` is required for, and only allowed with,
+   ``PoolBackend.MARVELL``.
+
+.. class:: torch_spyre._C.MarvellPlacement(pci_bdf, bar_offset=None)
+
+   The Marvell card of an arena and the offset of its window in BAR2. Leave
+   ``bar_offset`` as ``None`` to let ``create_pool`` place the window; the
+   effective configuration reports the chosen offset.
+
+.. class:: torch_spyre._C.PoolConfig(name, metadata, data_pools)
+
+   Configuration for the complete generation. ``metadata`` is a
+   ``MetadataConfig`` and ``data_pools`` is the complete arena list created
+   before the generation becomes ready.
+
+.. class:: torch_spyre._C.PoolDescriptor
+
+   Pickleable record containing the logical name, opaque generation,
+   lifecycle state, and effective configuration. It can be distributed with
+   ``torch.distributed.broadcast_object_list`` without attaching the sender or
+   receiver.
+
+.. class:: torch_spyre._C.SharedPool
+
+   .. staticmethod:: create_pool(config) -> PoolDescriptorResult
+
+      Create and publish a new persistent generation.
+
+   .. staticmethod:: open_pool(name) -> PoolDescriptorResult
+
+      Inspect a generation without attaching to it.
+
+   .. staticmethod:: destroy_pool(descriptor) -> DestroyResult
+
+      Destroy the descriptor's exact generation. Returns ``POOL_BUSY`` while
+      an attachment, retained metadata or data-pool handle, or read pin retains
+      the root lease.
+
+   .. staticmethod:: attach_pool(name, expected_generation, tp_rank) -> AttachResult
+
+      Primary worker API. Open the named generation, verify the controller-provided
+      16-byte generation token, and attach only if Flex's locked revalidation still
+      identifies that exact ready generation. Success returns the global metadata
+      directory and every ready-to-use data-pool mapping for ``tp_rank``. This call
+      never creates a pool.
+
+   .. staticmethod:: attach_pool(descriptor, tp_rank) -> AttachResult
+
+      Attach the requested rank using a complete descriptor.
+
+   .. staticmethod:: detach_pool(attachment) -> None
+
+      Close one ``PoolAttachment``. Detach never unlinks the pool and is
+      idempotent.
+
+.. class:: torch_spyre._C.PoolAttachment
+
+   Aggregate returned as ``AttachResult.attachment``. ``metadata`` is the global
+   directory, while ``data_pools`` contains ``AttachedDataPool`` entries for
+   exactly ``tp_rank``. ``close()`` releases the aggregate's ownership.
+
+.. class:: torch_spyre._C.AttachedDataPool
+
+   One rank-local ``registration`` and its already-mapped ``data_pool`` handle.
+   No follow-up resolution call is required.
+
+.. class:: torch_spyre._C.PoolResultCode
+
+   Structured result codes: ``OK``, ``NOT_FOUND``, ``ALREADY_EXISTS``,
+   ``INITIALIZING``, ``DESTROYING``, ``POOL_BUSY``, ``STALE_GENERATION``,
+   ``CONFIGURATION_MISMATCH``, and ``RESOURCE_ERROR``.
+
+.. class:: torch_spyre._C.SharedMetadata
+
+   Global attached metadata directory. It supports ``find_pool``, ``claim``,
+   ``publish``, ``abort``, ``lookup``, ``pin_read``, and ``evict``. Independently
+   retained metadata, ``SharedDataPool``, and ``SlotReadPin`` objects retain the
+   root lease after their aggregate attachment is closed.
+
 Profiler
 --------
 
@@ -593,53 +692,46 @@ manipulation of device tensor layouts. See
 KV Offload Pools
 ----------------
 
-A shared pool is a set of fixed-size, index-addressed slots, shared across
-processes by name, that a KV cache page can be copied to and from without
-going through a host tensor. Two kinds exist; both are accepted wherever a
-``SharedPool`` is.
+A data pool is a set of fixed-size, index-addressed slots that a KV cache page
+can be copied to and from without going through a host tensor. Every pool kind
+derives from ``SharedDataPool`` and is accepted wherever one is.
 
-.. class:: torch_spyre._C.SharedPool
+.. class:: torch_spyre._C.SharedDataPool
 
    Base class of the pool kinds below.
 
    .. method:: slot_count() -> int
    .. method:: slot_bytes() -> int
 
-      The slot stride in use, the requested size rounded up to 128 bytes.
+      The slot stride in use: the requested size rounded up to the host page
+      size for a host pool, and to 128 bytes for a Marvell pool.
 
    .. method:: total_bytes() -> int
    .. method:: name() -> str
 
 .. class:: torch_spyre._C.SharedHostPool
 
-   Slots in host POSIX shared memory.
-
-   .. staticmethod:: create_or_attach(name, num_slots, slot_bytes) -> SharedHostPool
-
-      Create the pool, or attach to one another process created under
-      ``name``. Attaching with a different geometry raises ``RuntimeError``.
-
-   .. staticmethod:: unlink_by_name(name)
-
-      Best-effort removal of a pool by name, for cleanup after a crashed owner.
+   Slots in host POSIX shared memory. Host pools have no factory of their own:
+   ``SharedPool.attach_pool`` returns them in ``PoolAttachment.data_pools``.
 
 .. class:: torch_spyre._C.SharedMarvellPool
 
    Slots in the PCI BAR2 window of a Marvell card. Copies go peer-to-peer
    between Spyre HBM and the card and never touch host DRAM; the Spyre card
    and the Marvell card must share a PCIe switch with ACS redirection
-   disabled. Only a small ``<name>.ctl`` control segment is in host shared
-   memory.
+   disabled. ``SharedPool.attach_pool`` returns one for each partition of a
+   ``PoolBackend.MARVELL`` arena.
 
    .. staticmethod:: create_or_attach(name, pci_bdf, num_slots, slot_bytes, bar_offset=0) -> SharedMarvellPool
 
-      Create or attach to the pool over
+      Raw pool outside the lifecycle, for DMA tests; its layout is kept in a
+      ``<name>.ctl`` control segment in host shared memory. Create or attach
+      to the pool over
       ``[bar_offset, bar_offset + num_slots * slot_bytes)`` of the BAR2 of
       ``pci_bdf`` (e.g. ``"0000:83:00.0"``). ``bar_offset`` must be 128-byte
       aligned and the window must fit in BAR2 (``ValueError`` otherwise).
-      Windows of pools under different names are **not** checked for
-      overlap: callers that create several pools must give them disjoint
-      ``bar_offset`` values.
+      Windows of raw pools are **not** checked against each other or against
+      lifecycle pools: callers must give them disjoint ``bar_offset`` values.
 
    .. staticmethod:: unlink_by_name(name)
 
@@ -660,9 +752,11 @@ going through a host tensor. Two kinds exist; both are accepted wherever a
 
 .. function:: torch_spyre._C.copy_tensor_raw(dev_tensor, pool, slot_id, to_device, non_blocking=False)
 
-   Copy a device tensor's bytes to or from one pool slot. The byte range is
-   taken from the tensor's logical offset and size and must be 128-byte
-   aligned; prefer ``copy_kv_page_raw`` for KV pages.
+   Copy a contiguous device tensor's bytes to or from one pool slot. A
+   tensor covering its whole allocation copies the full device image,
+   padding included; a partial view must be unpadded and copies its logical
+   byte range. Either range must be 128-byte aligned. Prefer
+   ``copy_kv_page_raw`` for KV pages.
 
 Warnings
 --------

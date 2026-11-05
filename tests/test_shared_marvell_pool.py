@@ -16,7 +16,8 @@
 
 A SharedMarvellPool's slots are a window of a Marvell card's PCI BAR2. These
 tests only open pools (which reads sysfs and creates the host-side "<name>.ctl"
-control segment); none of them issues a DMA, so they run on any Spyre card.
+control segment or a lifecycle root); none of them issues a DMA, so they run on
+any Spyre card.
 
 They need the Marvell card's PCI BDF in FLEX_TEST_PCI_BDF, the same variable
 flex's own SharedMarvellPool tests use, and are skipped without it.
@@ -27,10 +28,21 @@ import unittest
 
 from torch.testing._internal.common_utils import TestCase, run_tests
 
+from shared_pool_utils import destroy_pool_if_present
+from shared_pool_utils import unique_pool_name
 from torch_spyre._C import (  # type: ignore[attr-defined]
-    SharedHostPool,
+    MarvellPlacement,
+    MetadataConfig,
+    PoolBackend,
+    PoolCompatibility,
+    PoolConfig,
+    PoolResultCode,
+    SharedDataPartitionConfig,
+    SharedDataPool,
+    SharedDataPoolConfig,
     SharedMarvellPool,
     SharedPool,
+    SharedPoolKind,
 )
 
 MARVELL_BDF = os.environ.get("FLEX_TEST_PCI_BDF", "")
@@ -60,16 +72,14 @@ class TestSharedMarvellPool(TestCase):
         # so a segment leaked by a crashed run cannot be attached by mistake.
         self.name = f"tsmp_{os.getpid()}_{self._testMethodName}"
         SharedMarvellPool.unlink_by_name(self.name)
-        SharedHostPool.unlink_by_name(self.name)
 
     def tearDown(self):
         SharedMarvellPool.unlink_by_name(self.name)
-        SharedHostPool.unlink_by_name(self.name)
         super().tearDown()
 
-    def test_is_a_shared_pool(self):
+    def test_is_a_shared_data_pool(self):
         pool = SharedMarvellPool.create_or_attach(self.name, MARVELL_BDF, 2, 128)
-        self.assertIsInstance(pool, SharedPool)
+        self.assertIsInstance(pool, SharedDataPool)
         self.assertFalse(hasattr(pool, "slot_ptr"))
 
     def test_geometry(self):
@@ -118,13 +128,6 @@ class TestSharedMarvellPool(TestCase):
                 self.name, MARVELL_BDF, 4, 128, bar_offset=DEVICE_ALIGNMENT
             )
 
-    def test_host_pool_under_same_name_rejected(self):
-        pool = SharedMarvellPool.create_or_attach(self.name, MARVELL_BDF, 4, 128)
-        with self.assertRaises(RuntimeError):
-            SharedHostPool.create_or_attach(
-                self.name, pool.slot_count(), pool.slot_bytes()
-            )
-
     def test_invalid_arguments(self):
         # std::invalid_argument surfaces as ValueError.
         with self.assertRaises(ValueError):
@@ -169,6 +172,40 @@ class TestSharedMarvellPool(TestCase):
         self.assertEqual(recreated.slot_bytes(), 256)
         # Unlinking an absent name is not an error.
         SharedMarvellPool.unlink_by_name(self.name + "_absent")
+
+    def test_lifecycle_attach_returns_marvell_view(self):
+        """attach_pool hands out a Marvell arena's partition as a SharedMarvellPool."""
+        name = unique_pool_name("marvell-attach")
+        page = os.sysconf("SC_PAGE_SIZE")
+        arena = SharedDataPoolConfig(
+            "marvell-r0",
+            PoolBackend.MARVELL,
+            [SharedDataPartitionConfig("marvell-r0-c0", 0, 0, 2, page, None)],
+            PoolCompatibility("test-model", "float16", 16, 1),
+            marvell=MarvellPlacement(MARVELL_BDF),
+        )
+        created = SharedPool.create_pool(PoolConfig(name, MetadataConfig(1), [arena]))
+        self.assertIs(created.code, PoolResultCode.OK, created.detail)
+        attachment = None
+        try:
+            effective = created.descriptor.effective_config.data_pools[0]
+            self.assertIsNotNone(effective.marvell.bar_offset)  # placed by flex.
+            attached = SharedPool.attach_pool(created.descriptor, 0)
+            self.assertIs(attached.code, PoolResultCode.OK, attached.detail)
+            attachment = attached.attachment
+            (item,) = attachment.data_pools
+            self.assertIs(item.registration.kind, SharedPoolKind.MARVELL)
+            pool = item.data_pool
+            self.assertIsInstance(pool, SharedMarvellPool)
+            self.assertEqual(pool.slot_count(), 2)
+            bar_start, _ = read_bar2(MARVELL_BDF)
+            offset = effective.marvell.bar_offset + effective.partitions[0].offset_bytes
+            self.assertEqual(pool.bus_address, bar_start + offset)
+            self.assertFalse(ctl_exists(name))  # no raw control segment.
+            del pool, item
+        finally:
+            SharedPool.detach_pool(attachment)
+            destroy_pool_if_present(name)
 
 
 if __name__ == "__main__":

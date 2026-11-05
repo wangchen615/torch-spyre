@@ -29,7 +29,6 @@
 #include <cstdlib>     // std::getenv
 #include <filesystem>  // NOLINT(build/c++17)
 #include <flex/flex.hpp>
-#include <flex/memory_interface/shared_host_pool.hpp>
 #include <flex/memory_interface/shared_marvell_pool.hpp>
 #include <iostream>
 #include <memory>
@@ -51,6 +50,7 @@
 #include "logging_config.h"
 #include "perm_layout_native.h"
 #include "prepare_kernel.h"
+#include "shared_memory_bindings.h"
 #include "spyre_allocator.h"
 #include "spyre_composite_address.h"
 #include "spyre_device_enum.h"
@@ -275,6 +275,8 @@ PYBIND11_MODULE(_C, m) {
   // Initialize logging bindings
   torch_spyre::logging::init_logging_bindings(m);
 
+  torch_spyre::shared_memory::init_shared_memory_bindings(m);
+
   // Register the native scratchpad layout packer accelerator.
   torch_spyre::scratchpad::register_perm_layout_native(m);
 
@@ -288,39 +290,25 @@ PYBIND11_MODULE(_C, m) {
 
   py::class_<spyre::SpyreTensorLayout> dci_cls(m, "SpyreTensorLayout");
 
-  py::class_<flex::SharedPool>(m, "SharedPool")
-      .def("slot_count", &flex::SharedPool::SlotCount)
-      .def("slot_bytes", &flex::SharedPool::SlotBytes)
-      .def("name", &flex::SharedPool::Name)
-      .def("total_bytes", &flex::SharedPool::TotalBytes);
-
-  py::class_<flex::SharedHostPool, flex::SharedPool>(m, "SharedHostPool")
-      .def_static(
-          "create_or_attach",
-          [](const std::string& name, size_t num_slots, size_t slot_bytes) {
-            spyre::startRuntime();
-            return flex::SharedHostPool::CreateOrAttach(
-                spyre::GlobalRuntime::get(), name, num_slots, slot_bytes);
-          },
-          py::arg("name"), py::arg("num_slots"), py::arg("slot_bytes"))
-      .def_static("unlink_by_name", &flex::SharedHostPool::UnlinkByName,
-                  py::arg("name"));
-
   // Pool whose slots live in a Marvell card's PCI BAR2 window; copies are
-  // peer-to-peer between Spyre HBM and the card. Windows of two pools under
-  // different names are NOT checked for overlap: callers that create more than
-  // one pool must assign disjoint bar_offsets themselves.
-  py::class_<flex::SharedMarvellPool, flex::SharedPool>(m, "SharedMarvellPool")
+  // peer-to-peer between Spyre HBM and the card. create_or_attach pools are
+  // outside the lifecycle and their windows are NOT checked for overlap:
+  // callers must assign disjoint bar_offsets themselves. attach_pool also
+  // returns this type for Marvell arenas. SharedDataPool is registered by
+  // init_shared_memory_bindings above.
+  py::class_<flex::SharedMarvellPool, flex::SharedDataPool,
+             std::shared_ptr<flex::SharedMarvellPool>>(m, "SharedMarvellPool")
       .def_static(
           "create_or_attach",
           [](const std::string& name, const std::string& pci_bdf,
              size_t num_slots, size_t slot_bytes, uint64_t bar_offset) {
             // The factory takes no RuntimeContext, but copies on the pool go
-            // through a runtime stream, so bring the runtime up here as the
-            // host pool does.
+            // through a runtime stream, so bring the runtime up here as
+            // SharedPool.attach_pool does.
             spyre::startRuntime();
-            return flex::SharedMarvellPool::CreateOrAttach(
-                name, pci_bdf, num_slots, slot_bytes, bar_offset);
+            return std::shared_ptr<flex::SharedMarvellPool>(
+                flex::SharedMarvellPool::CreateOrAttach(
+                    name, pci_bdf, num_slots, slot_bytes, bar_offset));
           },
           py::arg("name"), py::arg("pci_bdf"), py::arg("num_slots"),
           py::arg("slot_bytes"), py::arg("bar_offset") = 0)
@@ -480,18 +468,14 @@ PYBIND11_MODULE(_C, m) {
         "Copy tensor between host and device using DMA", py::arg("self"),
         py::arg("dst"), py::arg("non_blocking") = false);
 
-  // Copy tensor raw function for KV Caching
   m.def("copy_tensor_raw", &spyre::copy_tensor_raw,
-        "Copy tensor between host and device, either way, using DMA",
+        "Copy one aligned tensor byte range through a shared pool slot",
         py::arg("dev_tensor"), py::arg("pool"), py::arg("slot_id"),
         py::arg("to_device"), py::arg("non_blocking") = false,
         py::call_guard<py::gil_scoped_release>());
 
   m.def("copy_kv_page_raw", &spyre::copy_kv_page_raw,
-        "Copy one KV cache page between a shared host pool slot and the "
-        "device. Takes the full cache and a block id; validates the production "
-        "KV-page contract and derives the physical page range from the device "
-        "layout. Throws before any DMA if the contract does not hold.",
+        "Copy one validated physical KV-cache page through a shared pool slot",
         py::arg("cache"), py::arg("block_id"), py::arg("pool"),
         py::arg("slot_id"), py::arg("to_device"),
         py::arg("non_blocking") = false,

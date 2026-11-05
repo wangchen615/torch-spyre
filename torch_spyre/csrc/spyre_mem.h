@@ -19,7 +19,7 @@
 #include <ATen/ATen.h>
 #include <c10/util/intrusive_ptr.h>
 
-#include <flex/memory_interface/shared_host_pool.hpp>
+#include <flex/memory_interface/shared_data_pool.hpp>
 
 #include "module.h"
 
@@ -34,25 +34,18 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
 at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
                            bool non_blocking);
 
-void copy_tensor_raw(const at::Tensor& dev_tensor, const flex::SharedPool& pool,
-                     size_t slot_id, bool to_device, bool non_blocking = false);
+void copy_tensor_raw(const at::Tensor& dev_tensor,
+                     const flex::SharedDataPool& pool, size_t slot_id,
+                     bool to_device, bool non_blocking = false);
 
 /**
- * Copy one KV cache page between a shared host pool slot and the device.
+ * Copy one physical KV-cache page between a shared pool slot and Spyre.
  *
- * Takes the full cache tensor and a block id rather than a page view, so the
- * base allocation's device layout is available for validation instead of being
- * reconstructed from an arbitrary view.
- *
- * Validates the production KV-page contract (explicit rank-4 row-major layout
- * with the page index folded into device dimension 0, stick-aligned head size,
- * whole block, in-range id, aligned and in-bounds range) and derives the single
- * physical page interval from the device image. Throws before enqueueing any
- * DMA if the contract does not hold; it never falls back to a logical byte
- * range.
+ * The full rank-4 cache is required so this function can validate its device
+ * layout and derive the aligned physical range before submitting DMA.
  */
 void copy_kv_page_raw(const at::Tensor& cache, size_t block_id,
-                      const flex::SharedPool& pool, size_t slot_id,
+                      const flex::SharedDataPool& pool, size_t slot_id,
                       bool to_device, bool non_blocking = false);
 
 /**

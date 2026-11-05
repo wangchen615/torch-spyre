@@ -331,4 +331,5 @@ and default stream. It does not own a separate runtime context.
 :maxdepth: 1
 
 memory_pressure_gc
+shared_metadata
 ```

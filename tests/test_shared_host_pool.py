@@ -12,140 +12,123 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Shared-host-pool geometry tests through the persistent lifecycle."""
 
 import torch
 
-from torch.testing._internal.common_utils import (
-    TestCase,
-    run_tests,
-)
-from transformers import AutoConfig
-
-from torch_spyre._C import (  # type: ignore[attr-defined]
-    SharedHostPool,
-    get_composite_address,
-)
-
-
-class TestSharedHostPool(TestCase):
-    """
-    Tests for the SharedHostPool functionality in the torch_spyre module.
-    """
-
-    def setUp(self):
-        super().setUp()
-
-        # Load the model configuration for ibm-ai-platform/micro-g3.3-8b-instruct-1b
-        self.cfg = AutoConfig.from_pretrained(
-            "ibm-ai-platform/micro-g3.3-8b-instruct-1b"
-        )
-        self.head_dim = self.cfg.hidden_size // self.cfg.num_attention_heads
-
-    def test_create_or_attach(self):
-        # Create a shared pool
-        shared_pool = SharedHostPool.create_or_attach(self.id(), 5, 5)
-
-        # Check if slot count is as expected
-        self.assertEqual(shared_pool.slot_count(), 5)
-
-        # Check if greater than or equal because the actual slot bytes may be
-        # larger due to alignment of size/stride of the pool
-        self.assertGreaterEqual(shared_pool.slot_bytes(), 5)
-
-    def test_attach_existing_pool(self):
-        # Create a shared pool and assign to _ to keep it alive
-        _ = SharedHostPool.create_or_attach(self.id(), 5, 5)
-
-        # Attach to the existing shared pool
-        shared_pool_compare = SharedHostPool.create_or_attach(self.id(), 5, 5)
-
-        self.assertEqual(shared_pool_compare.slot_count(), 5)
-        self.assertGreaterEqual(shared_pool_compare.slot_bytes(), 5)
-
-    def test_geometry_mismatch(self):
-        # Create a shared pool and assign to _ to keep it alive
-        _ = SharedHostPool.create_or_attach(self.id(), 5, 5)
-
-        # Attempt to attach to the existing shared pool with different geometry
-        with self.assertRaises(RuntimeError):
-            SharedHostPool.create_or_attach(self.id(), 10, 10)
-
-    def test_no_host_pointer(self):
-        # Create a shared pool
-        shared_pool = SharedHostPool.create_or_attach(self.id(), 5, 5)
-
-        # Confirm that the shared pool does not have a host pointer attribute
-        self.assertFalse(hasattr(shared_pool, "slot_ptr"))
-
-    def test_pool_real_model_small_slot(self):
-        """
-        Test SharedHostPool creation with real model ibm-ai-platform/micro-g3.3-8b-instruct-1b
-        with a small slot for K/V for 16 tokens 64 (KiB).
-        """
-        # Shape: num_hidden_layers x 2 (K & V) x 16 (block size) x num_key_value_heads x head_dim
-        block_size = 16
-        kv_page_shape = (
-            self.cfg.num_hidden_layers,
-            2,
-            block_size,
-            self.cfg.num_key_value_heads,
-            self.head_dim,
-        )
-
-        # Create a tensor for KV Cache page with the shape needed for the model
-        kv_page_tensor = torch.randn(kv_page_shape, device="spyre", dtype=torch.float16)
-
-        # Padded/tiled byte count of the page is the slot size
-        slot_bytes = get_composite_address(kv_page_tensor).total_size
-
-        # Choosing common prompt length of 8192 (tokens) for testing
-        slot_count = 8192 // block_size
-
-        SharedHostPool.create_or_attach(self.id(), int(slot_count), int(slot_bytes))
-
-    def test_pool_real_model_large_slot(self):
-        """
-        Test SharedHostPool creation with real model ibm-ai-platform/micro-g3.3-8b-instruct-1b
-        with a large slot for K/V for 1024 tokens 4 (MiB) to test a multi-MB page.
-        """
-        # Shape: num_hidden_layers x 2 (K & V) x 1024 (block size) x num_key_value_heads x head_dim
-        block_size = 1024
-        kv_page_shape = (
-            self.cfg.num_hidden_layers,
-            2,
-            block_size,
-            self.cfg.num_key_value_heads,
-            self.head_dim,
-        )
-
-        # Create a tensor for KV Cache page with the shape needed for the model
-        kv_page_tensor = torch.randn(kv_page_shape, device="spyre", dtype=torch.float16)
-
-        # Padded/tiled byte count of the page is the slot size
-        slot_bytes = get_composite_address(kv_page_tensor).total_size
-
-        # Choosing common prompt length of 8192 (tokens) for testing
-        slot_count = 8192 // block_size
-
-        SharedHostPool.create_or_attach(self.id(), int(slot_count), int(slot_bytes))
-
-    def test_name(self):
-        # Create a shared pool
-        shared_pool = SharedHostPool.create_or_attach(self.id(), 5, 5)
-
-        # Check if name is as expected
-        self.assertEqual(shared_pool.name(), self.id())
-
-    def test_total_bytes(self):
-        # Create a shared pool
-        shared_pool = SharedHostPool.create_or_attach(self.id(), 5, 5)
-
-        # Check if total bytes are as expected
-        self.assertEqual(
-            shared_pool.total_bytes(),
-            shared_pool.slot_count() * shared_pool.slot_bytes(),
-        )
+from shared_pool_utils import destroy_pool_if_present
+from shared_pool_utils import make_pool_config
+from shared_pool_utils import unique_pool_name
+from torch_spyre._C import PoolResultCode
+from torch_spyre._C import SharedDataPool
+from torch_spyre._C import SharedHostPool
+from torch_spyre._C import SharedPool
+from torch_spyre._C import MetadataConfig
+from torch_spyre._C import PoolBackend
+from torch_spyre._C import PoolCompatibility
+from torch_spyre._C import PoolConfig
+from torch_spyre._C import SharedDataPartitionConfig
+from torch_spyre._C import SharedDataPoolConfig
+from torch_spyre._C import copy_tensor_raw
 
 
-if __name__ == "__main__":
-    run_tests()
+def test_attached_host_pool_geometry_and_name():
+    """Eager attachment must return the configured child and geometry."""
+    name = unique_pool_name("host-geometry")
+    created = SharedPool.create_pool(make_pool_config(name, num_slots=5, slot_bytes=5))
+    assert created.code is PoolResultCode.OK
+    attached = SharedPool.attach_pool(created.descriptor, 0)
+    assert attached.code is PoolResultCode.OK
+    attachment = attached.attachment
+    entry = None
+    pool = None
+    try:
+        entry = attachment.data_pools[0]
+        assert entry.registration.name == "host-0"
+        pool = entry.data_pool
+
+        assert pool.name() == "host-0"
+        assert pool.slot_count() == 5
+        assert pool.slot_bytes() >= 5
+        assert pool.total_bytes() == pool.slot_count() * pool.slot_bytes()
+        assert not hasattr(attachment.metadata, "resolve_pool")
+    finally:
+        del pool
+        del entry
+        SharedPool.detach_pool(attachment)
+        destroy_pool_if_present(name)
+
+
+def test_attached_host_pool_preserves_data_pool_hierarchy():
+    """A host child must remain usable through the shared-data base API."""
+    name = unique_pool_name("host-hierarchy")
+    created = SharedPool.create_pool(
+        make_pool_config(name, num_slots=2, slot_bytes=128)
+    )
+    assert created.code is PoolResultCode.OK
+    attached = SharedPool.attach_pool(created.descriptor, 0)
+    assert attached.code is PoolResultCode.OK
+    attachment = attached.attachment
+    pool = None
+    try:
+        pool = attachment.data_pools[0].data_pool
+
+        assert isinstance(pool, SharedHostPool)
+        assert isinstance(pool, SharedDataPool)
+        assert not hasattr(pool, "slot_ptr")
+        assert not hasattr(pool, "create_or_attach")
+        assert not hasattr(pool, "unlink_by_name")
+    finally:
+        del pool
+        SharedPool.detach_pool(attachment)
+        destroy_pool_if_present(name)
+
+
+def test_partition_views_write_distinct_arena_offsets():
+    """Two logical partitions must not alias the same physical arena bytes."""
+    name = unique_pool_name("partition-offsets")
+    compatibility = PoolCompatibility("test-model", "float16", 16, 1)
+    config = PoolConfig(
+        name,
+        MetadataConfig(1),
+        [
+            SharedDataPoolConfig(
+                "host-0",
+                PoolBackend.HOST_DRAM,
+                [
+                    SharedDataPartitionConfig("host-r0-c0", 0, 0, 1, 128, None),
+                    SharedDataPartitionConfig("host-r0-c1", 0, 1, 1, 128, None),
+                ],
+                compatibility,
+            )
+        ],
+    )
+    created = SharedPool.create_pool(config)
+    assert created.code is PoolResultCode.OK
+    attached = SharedPool.attach_pool(created.descriptor, 0)
+    assert attached.code is PoolResultCode.OK
+    attachment = attached.attachment
+    entries = attachment.data_pools
+    by_name = {}
+    pools = []
+    try:
+        by_name = {entry.registration.name: entry.data_pool for entry in entries}
+        pools = [by_name["host-r0-c0"], by_name["host-r0-c1"]]
+        assert pools[0].name() != pools[1].name()
+
+        first = torch.arange(64, device="spyre", dtype=torch.float16)
+        second = first + 1000
+        copy_tensor_raw(first, pools[0], 0, to_device=False)
+        copy_tensor_raw(second, pools[1], 0, to_device=False)
+        first_result = torch.empty_like(first)
+        second_result = torch.empty_like(second)
+        copy_tensor_raw(first_result, pools[0], 0, to_device=True)
+        copy_tensor_raw(second_result, pools[1], 0, to_device=True)
+        assert torch.equal(first_result.cpu(), first.cpu())
+        assert torch.equal(second_result.cpu(), second.cpu())
+    finally:
+        pools.clear()
+        by_name.clear()
+        entries.clear()
+        SharedPool.detach_pool(attachment)
+        destroy_pool_if_present(name)

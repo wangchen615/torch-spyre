@@ -20,7 +20,7 @@
 #include <c10/core/Stream.h>
 
 #include <cstdint>
-#include <flex/memory_interface/shared_host_pool.hpp>
+#include <flex/memory_interface/shared_data_pool.hpp>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -68,7 +68,7 @@ class SpyreStream {
   // conversion internally (no FillParams construction here).
   void fillAsync(const flex::CompositeAddress* dst, double value,
                  DataFormats dtype, bool use_dmai) const;
-  void copyRaw(const flex::SharedPool& pool, size_t slot_id,
+  void copyRaw(const flex::SharedDataPool& pool, size_t slot_id,
                const flex::CompositeAddress* device_address, bool to_device,
                std::optional<flex::Range> range = std::nullopt) const;
 

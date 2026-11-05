@@ -15,9 +15,10 @@
 """Byte-movement tests for copy_kv_page_raw / copy_tensor_raw over each pool kind.
 
 The same page-level contract is checked against a SharedHostPool (slots in host
-POSIX SHM) and a SharedMarvellPool (slots in a Marvell card's BAR2, reached
-peer-to-peer from Spyre HBM). copy_kv_page_raw only sees a flex::SharedPool, so
-any difference between the two would be a transport defect in flex.
+POSIX SHM, from a lifecycle-managed pool) and a SharedMarvellPool (slots in a
+Marvell card's BAR2, reached peer-to-peer from Spyre HBM). copy_kv_page_raw only
+sees a flex::SharedDataPool, so any difference between the two would be a
+transport defect in flex.
 
 Every assertion is bitwise on the raw fp16 bit patterns, not a tolerance: a
 page reloaded at the wrong offset, from the wrong slot, or not at all must fail.
@@ -42,6 +43,7 @@ import unittest
 import torch
 from torch.testing._internal.common_utils import TestCase, run_tests
 
+from shared_pool_utils import LifecyclePool
 from torch_spyre._C import (  # type: ignore[attr-defined]
     SharedHostPool,
     SharedMarvellPool,
@@ -114,32 +116,28 @@ def bits(t):
 class _PoolRoundTrip:
     """Mixin: the tests, run against the pool returned by make_pool()."""
 
-    POOL_CLS: type
-
     def make_pool(self, name, num_slots, slot_bytes):
+        raise NotImplementedError
+
+    def release_pools(self):
+        """Release every pool make_pool() returned; called after all copies."""
         raise NotImplementedError
 
     def setUp(self):
         super().setUp()
         torch.spyre._impl._lazy_init()
-        self.names = []
-        self.pools = []
+        self.pool_count = 0
 
     def tearDown(self):
         # Drop the handles only after every copy has completed.
         torch.spyre.synchronize()
-        self.pools.clear()
-        for name in self.names:
-            self.POOL_CLS.unlink_by_name(name)
+        self.release_pools()
         super().tearDown()
 
     def pool(self, num_slots, slot_bytes):
-        name = f"tkvp_{os.getpid()}_{self._testMethodName}_{len(self.names)}"
-        self.POOL_CLS.unlink_by_name(name)
-        self.names.append(name)
-        p = self.make_pool(name, num_slots, slot_bytes)
-        self.pools.append(p)
-        return p
+        name = f"tkvp_{os.getpid()}_{self._testMethodName}_{self.pool_count}"
+        self.pool_count += 1
+        return self.make_pool(name, num_slots, slot_bytes)
 
     # ---- helpers ------------------------------------------------------------
 
@@ -288,22 +286,41 @@ class _PoolRoundTrip:
 
 @requires_hardware
 class TestKvOffloadSharedHostPool(_PoolRoundTrip, TestCase):
-    POOL_CLS = SharedHostPool
+    def setUp(self):
+        super().setUp()
+        self.managed = []
 
     def make_pool(self, name, num_slots, slot_bytes):
-        return SharedHostPool.create_or_attach(name, num_slots, slot_bytes)
+        managed = LifecyclePool(name, num_slots=num_slots, slot_bytes=slot_bytes)
+        self.managed.append(managed)
+        self.assertIsInstance(managed.pool, SharedHostPool)
+        return managed.pool
+
+    def release_pools(self):
+        # Close every generation even if one is still busy, then report it.
+        errors = []
+        for managed in self.managed:
+            try:
+                managed.close()
+            except RuntimeError as error:
+                errors.append(error)
+        self.managed.clear()
+        if errors:
+            raise errors[0]
 
 
 @requires_hardware
 @unittest.skipUnless(MARVELL_BDF, "FLEX_TEST_PCI_BDF (Marvell card BDF) not set")
 class TestKvOffloadSharedMarvellPool(_PoolRoundTrip, TestCase):
-    POOL_CLS = SharedMarvellPool
-
     def setUp(self):
         super().setUp()
         self.next_offset = BAR2_OFFSET
+        self.names = []
+        self.pools = []
 
     def make_pool(self, name, num_slots, slot_bytes):
+        SharedMarvellPool.unlink_by_name(name)
+        self.names.append(name)
         # Pools created within one test can be alive together, and flex does
         # not detect overlapping BAR2 windows, so give each its own window.
         offset = self.next_offset
@@ -311,7 +328,13 @@ class TestKvOffloadSharedMarvellPool(_PoolRoundTrip, TestCase):
             name, MARVELL_BDF, num_slots, slot_bytes, bar_offset=offset
         )
         self.next_offset = offset + pool.total_bytes()
+        self.pools.append(pool)
         return pool
+
+    def release_pools(self):
+        self.pools.clear()
+        for name in self.names:
+            SharedMarvellPool.unlink_by_name(name)
 
 
 if __name__ == "__main__":

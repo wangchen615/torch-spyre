@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <string>
@@ -928,26 +929,12 @@ at::Tensor& spyre_set_storage(at::Tensor& result, at::Storage storage,
 
 namespace {
 
-// ---- KV-page range derivation -------------------------------------------------
-//
-// A production decoder KV cache is allocated by spyre-inference with an explicit
-// SpyreTensorLayout (slot_major_kv_layout / head_major_kv_layout) that folds the
-// page index into device dimension 0. One page is then a single contiguous
-// physical interval at block_id * page_bytes.
-//
-// This must be derived from the DEVICE image, never from storage_offset() and
-// numel(): those describe the host view. They happen to agree when
-// head_size % elems_per_stick == 0, which holds for every decoder in scope, but
-// that equality is a consequence of the layout and must not be assumed. An
-// arbitrary allocation (e.g. torch.randn(10): 20 logical bytes in one padded
-// 128-byte stick) diverges immediately.
-
 std::vector<int64_t> row_major_strides(const std::vector<int64_t>& sizes) {
-  std::vector<int64_t> out(sizes.size(), 1);
-  for (int i = static_cast<int>(sizes.size()) - 2; i >= 0; i--) {
-    out[i] = out[i + 1] * sizes[i + 1];
+  std::vector<int64_t> strides(sizes.size(), 1);
+  for (int i = static_cast<int>(sizes.size()) - 2; i >= 0; --i) {
+    strides[i] = strides[i + 1] * sizes[i + 1];
   }
-  return out;
+  return strides;
 }
 
 struct KvPageRange {
@@ -955,157 +942,208 @@ struct KvPageRange {
   size_t length;
 };
 
-// Validate the KV-page contract and return the one physical page interval.
-// Throws (before any DMA is enqueued) if the tensor is not a recognized
-// production KV cache.
-KvPageRange derive_kv_page_range(const at::Tensor& cache, size_t block_id,
-                                 const flex::CompositeAddress* composite_address) {
-  // (1) On Spyre, with device layout metadata.
+size_t checked_size_bytes(size_t elements, size_t element_bytes,
+                          const char* operation) {
+  TORCH_CHECK(
+      element_bytes == 0 ||
+          elements <= std::numeric_limits<size_t>::max() / element_bytes,
+      operation, ": byte range overflows size_t");
+  return elements * element_bytes;
+}
+
+size_t checked_element_bytes(int64_t elements, size_t element_bytes,
+                             const char* operation) {
+  TORCH_CHECK(elements >= 0, operation, ": negative element count ", elements);
+  return checked_size_bytes(static_cast<size_t>(elements), element_bytes,
+                            operation);
+}
+
+size_t checked_dense_elements(c10::IntArrayRef sizes, const char* operation) {
+  size_t elements = 1;
+  for (const int64_t size : sizes) {
+    TORCH_CHECK(size >= 0, operation, ": negative allocation extent ", size);
+    const auto unsigned_size = static_cast<uint64_t>(size);
+    TORCH_CHECK(
+        unsigned_size == 0 ||
+            elements <= std::numeric_limits<size_t>::max() / unsigned_size,
+        operation, ": allocation element count overflows size_t");
+    elements *= static_cast<size_t>(unsigned_size);
+  }
+  return elements;
+}
+
+KvPageRange derive_tensor_raw_range(
+    const at::Tensor& tensor, const flex::CompositeAddress* composite_address) {
+  constexpr const char* kOperation = "copy_tensor_raw";
+  TORCH_CHECK(tensor.is_privateuseone(), kOperation,
+              ": tensor must be a Spyre tensor, got device ", tensor.device());
+  TORCH_CHECK(composite_address != nullptr, kOperation,
+              ": tensor has no composite address");
+  TORCH_CHECK(tensor.is_contiguous(), kOperation,
+              ": expected a contiguous tensor or view");
+
+  const auto* impl =
+      static_cast<const SpyreTensorImpl*>(tensor.unsafeGetTensorImpl());
+  const size_t allocation_elements =
+      checked_dense_elements(impl->dma_sizes, kOperation);
+  const size_t logical_elements = static_cast<size_t>(tensor.numel());
+  const size_t allocation_bytes = composite_address->total_size();
+
+  size_t offset = 0;
+  size_t length = 0;
+  if (tensor.storage_offset() == 0 && logical_elements == allocation_elements) {
+    length = allocation_bytes;
+  } else {
+    const size_t dense_allocation_bytes = checked_size_bytes(
+        allocation_elements, tensor.element_size(), kOperation);
+    TORCH_CHECK(
+        allocation_bytes == dense_allocation_bytes, kOperation,
+        ": a partial view of a padded device allocation is unsupported");
+    offset = checked_element_bytes(tensor.storage_offset(),
+                                   tensor.element_size(), kOperation);
+    length = checked_element_bytes(tensor.numel(), tensor.element_size(),
+                                   kOperation);
+    TORCH_CHECK(
+        offset <= allocation_bytes && length <= allocation_bytes - offset,
+        kOperation, ": tensor range [", offset, ", ", offset + length,
+        ") exceeds the allocation (", allocation_bytes, " B)");
+  }
+
+  TORCH_CHECK(length > 0, kOperation, ": byte range is empty");
+  TORCH_CHECK(offset % flex::DEVICE_ALIGNMENT == 0 &&
+                  length % flex::DEVICE_ALIGNMENT == 0,
+              kOperation, ": subrange must be ", flex::DEVICE_ALIGNMENT,
+              "-byte aligned, got offset=", offset, " length=", length);
+  return {offset, length};
+}
+
+KvPageRange derive_kv_page_range(
+    const at::Tensor& cache, size_t block_id,
+    const flex::CompositeAddress* composite_address) {
   TORCH_CHECK(cache.is_privateuseone(),
               "copy_kv_page_raw: cache must be a Spyre tensor, got device ",
               cache.device());
-  const SpyreTensorLayout stl = get_spyre_tensor_layout(cache);
-  const auto& ds = stl.device_size;
-  const auto& sm = stl.stride_map;
+  const SpyreTensorLayout layout = get_spyre_tensor_layout(cache);
+  const auto& device_size = layout.device_size;
+  const auto& stride_map = layout.stride_map;
 
-  // (2) Rank-4 logical [N, X, Y, D] and rank-4 device image.
-  TORCH_CHECK(cache.dim() == 4,
-              "copy_kv_page_raw: expected a rank-4 KV cache [N,X,Y,D], got rank ",
-              cache.dim());
-  TORCH_CHECK(ds.size() == 4,
-              "copy_kv_page_raw: expected a rank-4 device layout, got rank ",
-              ds.size(), ". A generic tiled layout (rank 5) is not a supported "
-              "KV cache; allocate via the spyre-inference allocate_pages path.");
+  TORCH_CHECK(
+      cache.dim() == 4,
+      "copy_kv_page_raw: expected a rank-4 KV cache [N,X,Y,D], got rank ",
+      cache.dim());
+  TORCH_CHECK(
+      device_size.size() == 4,
+      "copy_kv_page_raw: expected a rank-4 device layout, got rank ",
+      device_size.size(),
+      ". A generic tiled layout is not a supported KV cache; allocate it "
+      "with an explicit KV layout.");
 
   const int64_t num_blocks = cache.size(0);
   const int64_t head_size = cache.size(3);
-  const int64_t eps = ds[3];
-
-  // (3) Head size must fill whole sticks, or the device image is padded and no
-  // single host-derived range can describe it.
-  TORCH_CHECK(eps > 0, "copy_kv_page_raw: invalid stick width ", eps);
-  TORCH_CHECK(head_size % eps == 0,
+  const int64_t elements_per_stick = device_size[3];
+  TORCH_CHECK(elements_per_stick > 0, "copy_kv_page_raw: invalid stick width ",
+              elements_per_stick);
+  TORCH_CHECK(head_size % elements_per_stick == 0,
               "copy_kv_page_raw: head_size ", head_size,
-              " is not a multiple of the stick width ", eps,
-              "; the device image is padded and one byte range cannot describe "
-              "a page");
+              " is not a multiple of the stick width ", elements_per_stick,
+              "; the device image is padded and one byte range cannot "
+              "describe a page");
 
-  // (4) Device layout must be exactly [N*X, Y, D/eps, eps], row-major. This is
-  // what makes a page contiguous; reject anything else rather than compute a
-  // plausible-looking range for a scattered image.
-  TORCH_CHECK(ds[2] * ds[3] == head_size,
-              "copy_kv_page_raw: device layout stick dims ", ds[2], "x", ds[3],
-              " do not cover head_size ", head_size);
-  const auto expected_sm = row_major_strides(ds);
-  TORCH_CHECK(sm == expected_sm,
+  TORCH_CHECK(device_size[2] * device_size[3] == head_size,
+              "copy_kv_page_raw: device layout stick dims ", device_size[2],
+              "x", device_size[3], " do not cover head_size ", head_size);
+  TORCH_CHECK(stride_map == row_major_strides(device_size),
               "copy_kv_page_raw: device stride_map is not row-major over "
-              "device_size; a page is not one contiguous interval. Expected "
-              "stride_map matching the row-major strides of the device size.");
-  // Device dim 0 folds (page, inner) where inner is the block size for the
-  // token-major layout [B,S,H,D] and the local KV head count for the head-major
-  // layout [B,H,S,D]. The identity must be EXACT, not merely divisible: a
-  // zero-offset prefix view such as cache[0:4] keeps the whole cache's layout
-  // (spyre_views.cpp propagates spyre_layout verbatim) while reporting a
-  // smaller size(0), so ds[0] % num_blocks == 0 still holds and page_bytes
-  // would come out an integer multiple too large. Requiring
-  // num_blocks * inner == ds[0] pins num_blocks to the real page count.
-  TORCH_CHECK(num_blocks > 0,
-              "copy_kv_page_raw: cache has no pages (size(0) = ", num_blocks, ")");
-  const int64_t inner = ds[0] / num_blocks;
-  TORCH_CHECK(num_blocks * inner == ds[0] &&
-                  (inner == cache.size(1) || inner == cache.size(2)),
-              "copy_kv_page_raw: device dim 0 (", ds[0],
-              ") is not num_blocks (", num_blocks,
-              ") times the per-page inner extent (got ", inner,
-              ", expected size(1)=", cache.size(1), " or size(2)=",
-              cache.size(2),
-              "). Either the page index is not folded into device dimension 0, "
-              "or this is a view over part of a cache rather than a whole "
-              "cache; pass the full cache and a block_id.");
+              "device_size; a page is not one contiguous interval");
 
-  // (5) The tensor must be the full cache, not an arbitrary slice of one.
+  TORCH_CHECK(num_blocks > 0,
+              "copy_kv_page_raw: cache has no pages (size(0) = ", num_blocks,
+              ")");
+  TORCH_CHECK(device_size[0] >= 0 && device_size[1] >= 0,
+              "copy_kv_page_raw: device layout has a negative extent");
+  const bool first_dimension_matches = device_size[0] % num_blocks == 0;
+  const int64_t inner =
+      first_dimension_matches ? device_size[0] / num_blocks : int64_t{-1};
+  const bool token_major = first_dimension_matches && inner == cache.size(1) &&
+                           device_size[1] == cache.size(2);
+  const bool head_major = first_dimension_matches && inner == cache.size(2) &&
+                          device_size[1] == cache.size(1);
+  TORCH_CHECK(token_major || head_major,
+              "copy_kv_page_raw: device geometry does not describe the full "
+              "cache; device dims ",
+              device_size[0], "x", device_size[1], ", logical dims ",
+              cache.size(0), "x", cache.size(1), "x", cache.size(2),
+              ". Pass the full cache and a block_id.");
+
   TORCH_CHECK(cache.storage_offset() == 0,
               "copy_kv_page_raw: expected the full cache allocation "
-              "(storage_offset 0), got ", cache.storage_offset(),
-              ". Pass the cache and a block_id, not a page view.");
+              "(storage_offset 0), got ",
+              cache.storage_offset());
   TORCH_CHECK(cache.is_contiguous(),
               "copy_kv_page_raw: expected a contiguous logical cache tensor");
+  const auto block_count = static_cast<size_t>(num_blocks);
+  TORCH_CHECK(block_id < block_count, "copy_kv_page_raw: block_id ", block_id,
+              " out of range [0, ", num_blocks, ")");
 
-  // (6) Block in range.
-  TORCH_CHECK(static_cast<int64_t>(block_id) < num_blocks,
-              "copy_kv_page_raw: block_id ", block_id, " out of range [0, ",
-              num_blocks, ")");
-
-  // Derive page_bytes from the device image, including stick padding.
-  const uint64_t total_bytes = get_device_size_in_bytes(stl);
-
+  const uint64_t total_bytes = get_device_size_in_bytes(layout);
   TORCH_CHECK(total_bytes % static_cast<uint64_t>(num_blocks) == 0,
               "copy_kv_page_raw: device image ", total_bytes,
               " B does not divide evenly into ", num_blocks, " pages");
-  const uint64_t page_bytes = total_bytes / static_cast<uint64_t>(num_blocks);
+  const uint64_t page_bytes = total_bytes / num_blocks;
+  TORCH_CHECK(page_bytes == 0 ||
+                  block_id <= std::numeric_limits<uint64_t>::max() / page_bytes,
+              "copy_kv_page_raw: page offset overflows uint64_t");
   const uint64_t offset = static_cast<uint64_t>(block_id) * page_bytes;
 
-  // (7) Alignment and bounds against the physical allocation.
   TORCH_CHECK(page_bytes > 0, "copy_kv_page_raw: computed page_bytes is zero");
   TORCH_CHECK(offset % flex::DEVICE_ALIGNMENT == 0 &&
                   page_bytes % flex::DEVICE_ALIGNMENT == 0,
               "copy_kv_page_raw: page range must be ", flex::DEVICE_ALIGNMENT,
               "-byte aligned, got offset=", offset, " length=", page_bytes);
-  const size_t alloc_bytes = composite_address->total_size();
-  TORCH_CHECK(offset + page_bytes <= alloc_bytes,
-              "copy_kv_page_raw: page range [", offset, ", ",
-              offset + page_bytes, ") exceeds the allocation (", alloc_bytes,
-              " B)");
+  const size_t allocation_bytes = composite_address->total_size();
+  TORCH_CHECK(total_bytes == allocation_bytes,
+              "copy_kv_page_raw: full device image is ", total_bytes,
+              " B but the allocation is ", allocation_bytes, " B");
+  TORCH_CHECK(
+      offset <= allocation_bytes && page_bytes <= allocation_bytes - offset,
+      "copy_kv_page_raw: page range [", offset, ", ", offset + page_bytes,
+      ") exceeds the allocation (", allocation_bytes, " B)");
 
-  SPYRE_RUNTIME_DEBUG() << "copy_kv_page_raw: block " << block_id << " -> Range("
-                        << offset << ", " << page_bytes << ") of " << alloc_bytes
-                        << " B";
-  return KvPageRange{static_cast<size_t>(offset),
-                     static_cast<size_t>(page_bytes)};
+  return {static_cast<size_t>(offset), static_cast<size_t>(page_bytes)};
 }
 
 }  // namespace
 
 void copy_kv_page_raw(const at::Tensor& cache, size_t block_id,
-                      const flex::SharedPool& pool, size_t slot_id,
+                      const flex::SharedDataPool& pool, size_t slot_id,
                       bool to_device, bool non_blocking) {
   SpyreStream stream = getCurrentStream(cache.device());
-
   const flex::CompositeAddress* composite_address =
       spyre::get_composite_address(cache);
-
-  // Validate and derive before enqueueing anything. On failure nothing is
-  // submitted, so the host slot and device allocation are left untouched.
-  const KvPageRange r =
+  const KvPageRange range =
       derive_kv_page_range(cache, block_id, composite_address);
 
   stream.copyRaw(pool, slot_id, composite_address, to_device,
-                 flex::Range(r.offset, r.length));
-
+                 flex::Range(range.offset, range.length));
   if (!non_blocking) {
     stream.synchronize();
   }
 }
 
-void copy_tensor_raw(const at::Tensor& dev_tensor, const flex::SharedPool& pool,
-                     size_t slot_id, bool to_device, bool non_blocking) {
-  c10::Device device = dev_tensor.device();
-  SpyreStream stream = getCurrentStream(device);
-
-  size_t offset = dev_tensor.storage_offset() * dev_tensor.element_size();
-  size_t length = dev_tensor.numel() * dev_tensor.element_size();
-
+void copy_tensor_raw(const at::Tensor& dev_tensor,
+                     const flex::SharedDataPool& pool, size_t slot_id,
+                     bool to_device, bool non_blocking) {
+  TORCH_CHECK(dev_tensor.is_privateuseone(),
+              "copy_tensor_raw: tensor must be a Spyre tensor, got device ",
+              dev_tensor.device());
   const flex::CompositeAddress* composite_address =
       spyre::get_composite_address(dev_tensor);
-
-  TORCH_CHECK(offset % flex::DEVICE_ALIGNMENT == 0 &&
-                  length % flex::DEVICE_ALIGNMENT == 0,
-              "copy_tensor_raw: subrange must be 128-byte aligned, got offset=",
-              offset, " length=", length);
+  const KvPageRange range =
+      derive_tensor_raw_range(dev_tensor, composite_address);
+  SpyreStream stream = getCurrentStream(dev_tensor.device());
 
   stream.copyRaw(pool, slot_id, composite_address, to_device,
-                 flex::Range(offset, length));
-
+                 flex::Range(range.offset, range.length));
   if (!non_blocking) {
     stream.synchronize();
   }

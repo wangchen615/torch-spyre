@@ -12,119 +12,105 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""M1 raw-copy regression coverage through lifecycle-managed pools."""
 
 import torch
+from torch.testing._internal.common_utils import TestCase
 
-from torch.testing._internal.common_utils import (
-    TestCase,
-    run_tests,
-)
-from transformers import AutoConfig
-
-from torch_spyre._C import (  # type: ignore[attr-defined]
-    SharedHostPool,
-    copy_tensor_raw,
-    get_composite_address,
-)
+from shared_pool_utils import LifecyclePool
+from torch_spyre._C import copy_tensor_raw
+from torch_spyre._C import get_composite_address
 
 
-class TestSpyre(TestCase):
-    def setUp(self):
-        super().setUp()
-
-        # Load the model configuration for ibm-ai-platform/micro-g3.3-8b-instruct-1b
-        self.cfg = AutoConfig.from_pretrained(
-            "ibm-ai-platform/micro-g3.3-8b-instruct-1b"
-        )
-        self.head_dim = self.cfg.hidden_size // self.cfg.num_attention_heads
-
-    def _kv_offload_reload(self, kv_page_tensor, kv_page_tensor_reload):
-        """
-        Test if the bytes survived a round trip from spyre to host memory pool and back to spyre.
-        """
-        # Composite address handle for the tensor to determine the size of the slot needed in the shared host pool
-        slot_bytes = get_composite_address(kv_page_tensor).total_size
-
-        # Create the shared pool with a single slot of the required size
-        pool = SharedHostPool.create_or_attach(
-            self.id(), num_slots=1, slot_bytes=slot_bytes
-        )
-
-        # Use the first slot in the pool
-        slot_id = 0
-
-        # D2H: Move tensor from spyre to host memory pool or fill kv_page_data into the shared host pool
-        copy_tensor_raw(kv_page_tensor, pool, slot_id, to_device=False)
-
-        # H2D: Move tensor back from host memory pool to spyre
-        copy_tensor_raw(kv_page_tensor_reload, pool, slot_id, to_device=True)
-
-        self.assertEqual(kv_page_tensor.to("cpu"), kv_page_tensor_reload.to("cpu"))
+class TestKvOffload(TestCase):
+    def _kv_offload_reload(self, source, destination, label):
+        """Round-trip one tensor through a fixed shared-host slot."""
+        slot_bytes = get_composite_address(source).total_size
+        managed = LifecyclePool(label, num_slots=1, slot_bytes=slot_bytes)
+        try:
+            copy_tensor_raw(source, managed.pool, 0, to_device=False)
+            copy_tensor_raw(destination, managed.pool, 0, to_device=True)
+            self.assertEqual(source.to("cpu"), destination.to("cpu"))
+        finally:
+            managed.close()
 
     def test_kv_offload_reload_zeroed(self):
-        tensor_on_spyre = torch.randn(10, device="spyre", dtype=torch.float16)
-        self._kv_offload_reload(tensor_on_spyre, torch.zeros_like(tensor_on_spyre))
+        source = torch.randn(64, device="spyre", dtype=torch.float16)
+        self._kv_offload_reload(source, torch.zeros_like(source), self.id())
 
-    def test_kv_offload_reload_diff_tensor(self):
-        tensor_on_spyre = torch.randn(10, device="spyre", dtype=torch.float16)
-        self._kv_offload_reload(tensor_on_spyre, torch.empty_like(tensor_on_spyre))
+    def test_kv_offload_reload_different_tensor(self):
+        source = torch.randn(64, device="spyre", dtype=torch.float16)
+        self._kv_offload_reload(source, torch.empty_like(source), self.id())
+
+    def test_raw_copy_preserves_padded_contiguous_tensor(self):
+        for shape in ((64, 96), (2, 32)):
+            with self.subTest(shape=shape):
+                source = (
+                    torch.arange(
+                        torch.Size(shape).numel(),
+                        dtype=torch.float16,
+                    )
+                    .reshape(shape)
+                    .to("spyre")
+                )
+                self._kv_offload_reload(source, torch.zeros_like(source), self.id())
+
+    def test_raw_copy_rejects_strided_view(self):
+        base = torch.arange(
+            4 * 64,
+            device="spyre",
+            dtype=torch.float16,
+        ).reshape(4, 64)
+        view = base[::2]
+        self.assertFalse(view.is_contiguous())
+        managed = LifecyclePool(
+            self.id(),
+            num_slots=1,
+            slot_bytes=get_composite_address(base).total_size,
+        )
+        try:
+            with self.assertRaisesRegex(RuntimeError, "contiguous"):
+                copy_tensor_raw(view, managed.pool, 0, to_device=False)
+        finally:
+            managed.close()
+
+    def test_raw_copy_rejects_cpu_tensor_before_address_lookup(self):
+        source = torch.zeros(64, dtype=torch.float16)
+        managed = LifecyclePool(self.id(), num_slots=1, slot_bytes=128)
+        try:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "copy_tensor_raw: tensor must be a Spyre tensor",
+            ):
+                copy_tensor_raw(source, managed.pool, 0, to_device=False)
+        finally:
+            managed.close()
 
     def test_normal_copy_tensor_unaffected(self):
-        """
-        Ensure the normal copy_tensor (.to()) function is unaffected.
-        """
-        tensor = torch.randn(10, dtype=torch.float16)
-        tensor_on_spyre = tensor.to("spyre")
-        tensor_back = tensor_on_spyre.to("cpu")
-        self.assertEqual(tensor, tensor_back)
+        source = torch.randn(10, dtype=torch.float16)
+        reloaded = source.to("spyre").to("cpu")
+        self.assertEqual(source, reloaded)
 
-    def test_real_model_small_slot(self):
-        """
-        Test copy_tensor_raw functionality with real model ibm-ai-platform/micro-g3.3-8b-instruct-1b
-        with a small slot for K/V for 16 tokens 64 (KiB).
-        """
-        # Shape: 2 (K & V) x 16 (block size) x num_key_value_heads x head_dim
-        kv_page_shape = (2, 16, self.cfg.num_key_value_heads, self.head_dim)
+    def test_realistic_small_kv_page(self):
+        source = torch.randn((2, 16, 8, 128), device="spyre", dtype=torch.float16)
+        self._kv_offload_reload(source, torch.zeros_like(source), self.id())
 
-        # Create a tensor for KV Cache page with the shape needed for the model
-        kv_page_tensor = torch.randn(kv_page_shape, device="spyre", dtype=torch.float16)
-        self._kv_offload_reload(kv_page_tensor, torch.zeros_like(kv_page_tensor))
-
-    def test_real_model_large_slot(self):
-        """
-        Test copy_tensor_raw functionality with real model ibm-ai-platform/micro-g3.3-8b-instruct-1b
-        with a large slot for K/V for 1024 tokens 4 (MiB) to test a multi-MB page.
-        """
-        # Shape: 2 (K & V) x 1024 (block size) x num_key_value_heads x head_dim
-        kv_page_shape = (2, 1024, self.cfg.num_key_value_heads, self.head_dim)
-
-        # Create a tensor for KV Cache page with the shape needed for the model
-        kv_page_tensor = torch.randn(kv_page_shape, device="spyre", dtype=torch.float16)
-        self._kv_offload_reload(kv_page_tensor, torch.zeros_like(kv_page_tensor))
+    def test_realistic_large_kv_page(self):
+        source = torch.randn((2, 1024, 8, 128), device="spyre", dtype=torch.float16)
+        self._kv_offload_reload(source, torch.zeros_like(source), self.id())
 
     def test_page_view_offload(self):
-        """
-        Offload one page of a multi page cache then reload to see if it correctly
-        survives d2h and h2d transfers.
-        """
-        # 4 pages of 64 fp16 elements. One page is a 128 byte stick.
         cache = torch.arange(4 * 64, device="spyre", dtype=torch.float16).reshape(4, 64)
         page = cache[2]
-
-        slot_bytes = page.numel() * page.element_size()
-        pool = SharedHostPool.create_or_attach(
-            self.id(), num_slots=1, slot_bytes=slot_bytes
+        managed = LifecyclePool(
+            self.id(),
+            num_slots=1,
+            slot_bytes=page.numel() * page.element_size(),
         )
-
-        # D2H: only page 2 should land in slot 0
-        copy_tensor_raw(page, pool, 0, to_device=False)
-
-        # H2D: read the page back to a empty tensor
-        reloaded = torch.empty_like(page)
-        copy_tensor_raw(reloaded, pool, 0, to_device=True)
-
-        self.assertEqual(page.to("cpu"), reloaded.to("cpu"))
-
-
-if __name__ == "__main__":
-    run_tests()
+        try:
+            copy_tensor_raw(page, managed.pool, 0, to_device=False)
+            reloaded = torch.empty_like(page)
+            copy_tensor_raw(reloaded, managed.pool, 0, to_device=True)
+            self.assertEqual(page.to("cpu"), reloaded.to("cpu"))
+        finally:
+            managed.close()

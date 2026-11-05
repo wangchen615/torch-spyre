@@ -12,101 +12,127 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Two-rank raw-copy verification through a persistent host pool."""
+
 import os
 
 import pytest
 import torch
 import torch.distributed as dist
-from torch.testing._internal.common_utils import TestCase, run_tests
+from torch.testing._internal.common_utils import TestCase
+from torch.testing._internal.common_utils import run_tests
 
-from torch_spyre._C import (  # type: ignore[attr-defined]
-    SharedHostPool,
-    copy_tensor_raw,
-    get_composite_address,
-)
+from torch_spyre._C import MetadataConfig
+from torch_spyre._C import PoolBackend
+from torch_spyre._C import PoolCompatibility
+from torch_spyre._C import PoolConfig
+from torch_spyre._C import PoolResultCode
+from torch_spyre._C import SharedDataPartitionConfig
+from torch_spyre._C import SharedDataPoolConfig
+from torch_spyre._C import SharedPool
+from torch_spyre._C import copy_tensor_raw
+from torch_spyre._C import get_composite_address
 
 
-# Skip all tests if RANK is not defined, or WORLD_SIZE is not set or less than 2
-if "RANK" not in os.environ:
-    pytest.skip(
-        "RANK environment variable not defined, skipping distributed tests",
-        allow_module_level=True,
-    )
+if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
+    pytest.skip("distributed environment is not configured", allow_module_level=True)
+if int(os.environ["WORLD_SIZE"]) != 2:
+    pytest.skip("this test requires exactly two ranks", allow_module_level=True)
 
-if "WORLD_SIZE" not in os.environ:
-    pytest.skip(
-        "WORLD_SIZE environment variable not defined, skipping distributed tests",
-        allow_module_level=True,
-    )
 
-try:
-    world_size = int(os.environ.get("WORLD_SIZE", "0"))
-    if world_size < 2:
-        pytest.skip(
-            f"WORLD_SIZE is {world_size}, need at least 2 for distributed tests",
-            allow_module_level=True,
-        )
-except ValueError:
-    pytest.skip(
-        "WORLD_SIZE environment variable is not a valid integer, skipping distributed tests",
-        allow_module_level=True,
-    )
-
-DEVICE = torch.device(f"spyre:{os.getenv('RANK', '0')}")
+DEVICE = torch.device(f"spyre:{os.environ['RANK']}")
 C10D_BACKEND = "spyreccl"
+
+
+def destroy_pool_if_present(name):
+    opened = SharedPool.open_pool(name)
+    if opened.code is PoolResultCode.OK:
+        result = SharedPool.destroy_pool(opened.descriptor)
+        if result.code not in (PoolResultCode.OK, PoolResultCode.NOT_FOUND):
+            raise RuntimeError(f"failed to clean {name}: {result.code}")
+
+
+def make_config(name, slot_bytes):
+    compatibility = PoolCompatibility("distributed-test", "float16", 64, 2)
+    arenas = [
+        SharedDataPoolConfig(
+            f"arena-r{rank}",
+            PoolBackend.HOST_DRAM,
+            [SharedDataPartitionConfig(f"host-r{rank}", rank, 0, 1, slot_bytes)],
+            compatibility,
+        )
+        for rank in range(2)
+    ]
+    return PoolConfig(name, MetadataConfig(1), arenas)
 
 
 class TestKVOffloadCrossProcess(TestCase):
     @classmethod
     def setUpClass(cls):
-        """Set up the distributed environment once for all tests."""
         if not dist.distributed_c10d.is_backend_available(C10D_BACKEND):
-            raise RuntimeError(f"Error: Missing the C10 Backend {C10D_BACKEND}")
-        if C10D_BACKEND != dist.get_default_backend_for_device("spyre"):
-            raise RuntimeError(
-                f"Error: Missing a C10 Backend for 'spyre'! Expected {C10D_BACKEND}"
-            )
-
+            raise RuntimeError(f"missing C10 backend {C10D_BACKEND}")
         if not dist.is_initialized():
             dist.init_process_group(f"cpu:gloo,spyre:{C10D_BACKEND}")
-
-        cls.comm_size = dist.get_world_size()
         cls.comm_rank = dist.get_rank()
 
     @classmethod
     def tearDownClass(cls):
-        """Clean up the distributed environment after all tests."""
         if dist.is_initialized():
             dist.destroy_process_group()
 
     def test_cross_process_reload(self):
-        """
-        Test that a tensor offloaded in one process can be reloaded in another.
-        """
+        expected = torch.arange(64, device=DEVICE, dtype=torch.float16)
+        slot_bytes = get_composite_address(expected).total_size
+        name = f"torch-spyre-dist-kv-{self.id()}"
+        descriptor_box = [None]
+        attachment = None
+        pool = None
+        descriptor = None
+        try:
+            if self.comm_rank == 0:
+                destroy_pool_if_present(name)
+                created = SharedPool.create_pool(make_config(name, slot_bytes))
+                self.assertIs(created.code, PoolResultCode.OK)
+                opened = SharedPool.open_pool(name)
+                self.assertIs(opened.code, PoolResultCode.OK)
+                self.assertEqual(opened.descriptor, created.descriptor)
+                descriptor_box[0] = opened.descriptor
 
-        expected_tensor = torch.arange(10, device=DEVICE, dtype=torch.float16)
-        num_slots = 1
-        slot_bytes = get_composite_address(expected_tensor).total_size
-        name = self.id()
+            dist.broadcast_object_list(descriptor_box, src=0)
+            descriptor = descriptor_box[0]
+            result = SharedPool.attach_pool(descriptor, self.comm_rank)
+            self.assertIs(result.code, PoolResultCode.OK)
+            attachment = result.attachment
+            self.assertEqual(attachment.tp_rank, self.comm_rank)
+            entries = attachment.data_pools
+            self.assertEqual(
+                [item.registration.name for item in entries],
+                [f"host-r{self.comm_rank}"],
+            )
+            pool = entries[0].data_pool
+            entries.clear()
 
-        if self.comm_rank == 0:
-            # Process 0: Offload the tensor to the shared host pool
-            pool = SharedHostPool.create_or_attach(name, num_slots, slot_bytes)
-            copy_tensor_raw(expected_tensor, pool, 0, to_device=False)
+            copy_tensor_raw(expected, pool, 0, to_device=False)
+            dist.barrier()
 
-        dist.barrier()  # Ensure process 0 has completed offloading
-
-        # Process 1: Reload the tensor from the shared host pool
-        if self.comm_rank == 1:
-            pool = SharedHostPool.create_or_attach(name, num_slots, slot_bytes)
-            reloaded_tensor = torch.empty_like(expected_tensor)
-            copy_tensor_raw(reloaded_tensor, pool, 0, to_device=True)
-
-            # Verify that the reloaded tensor matches the expected tensor
-            self.assertEqual(expected_tensor.to("cpu"), reloaded_tensor.to("cpu"))
-
-        # Ensure process 0 doesn't exit so pool is not destroyed before process 1 is done with it
-        dist.barrier()
+            reloaded = torch.empty_like(expected)
+            copy_tensor_raw(reloaded, pool, 0, to_device=True)
+            self.assertEqual(expected.cpu(), reloaded.cpu())
+            dist.barrier()
+        finally:
+            pool = None
+            if attachment is not None:
+                SharedPool.detach_pool(attachment)
+            if dist.is_initialized():
+                dist.barrier()
+            if self.comm_rank == 0 and descriptor is not None:
+                result = SharedPool.destroy_pool(descriptor)
+                self.assertIn(
+                    result.code,
+                    (PoolResultCode.OK, PoolResultCode.NOT_FOUND),
+                )
+            if dist.is_initialized():
+                dist.barrier()
 
 
 if __name__ == "__main__":

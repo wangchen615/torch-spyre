@@ -1,81 +1,90 @@
-# KV-Offload (`copy_tensor_raw`) — Test Results
+# Persistent KV offload M4 test results
 
-Branch: `kvc-offload-poc`
-Date: 2026-09-22
+Branch: `kvc-offload-m4`  
+Date: 2026-10-31
 
-## Branch contents
+## Build under test
 
-Three stacked commits on current `main`:
+The eager rank-scoped migration used the isolated stack at
+`/tmp/kvc-offload-m4-dev-stack-1000800000`:
 
-1. `7b7c107b` — SharedPool/SharedHostPool pybind passthrough (squashed from upstream #3915)
-2. `040cd8f7` — `copy_tensor_raw` pybind wrapper, `SpyreStream::copyRaw`, and KV-offload tests
-3. `b51d31f8` — compat: call `flex::compositeAddressToDmva` for the installed flex
+- Flex came from
+  `/home/yzhu/dt-inductor/flex-worktrees/persistent-shared-kv-pool-lifecycle`
+  with its eager attachment changes and was installed under the stack's
+  `runtime` directory.
+- torch-spyre came from this worktree at baseline `a1c08b470` plus the
+  uncommitted migration changes.
+- torch-spyre rebuilt successfully against that Flex install with
+  `USE_SPYRE_PROFILER=0`.
+- Spyre Comms came from
+  `/home/yzhu/dt-inductor/sentient/spyre_comms-m4-compat`.
 
-## How to run
+Profiler support was disabled because the installed libaiupti headers do not
+provide `AIUPTI_ACTIVITY_KIND_THREAD`. The shared-pool extension compiled,
+linked, installed, and imported against the intended Flex library.
 
-```bash
-python3 -m pytest tests/test_kv_offload.py -v
-```
+## Single-process shared-pool suite
 
-Undeclared test dependency: `transformers` (not in `pyproject.toml`) —
-`uv pip install transformers` if missing. The two `test_real_model_*` tests
-import `AutoConfig`.
-
-## Summary: 4 passed, 2 failed (13.36 s, no hangs)
-
-| Test | Result | Notes |
-|---|---|---|
-| `test_normal_copy_tensor_unaffected` | PASS | Regular tensor copy path is unaffected by the new raw path. |
-| `test_page_view_offload` | PASS | Page-view (sliced) offload round-trip. |
-| `test_real_model_large_slot` | PASS | Real model config, large host-pool slot. |
-| `test_real_model_small_slot` | PASS | Real model config, small host-pool slot. |
-| `test_kv_offload_reload_zeroed` | **FAIL** | Alignment (see below). |
-| `test_kv_offload_reload_diff_tensor` | **FAIL** | Alignment (see below). |
-
-## Why the two failures — pre-existing branch self-contradiction
-
-Both failures are the **same** root cause, and both are a defect **in the
-source branch (thakobian:copy_tensor_raw / upstream #3964)**, not a rebase
-artifact and not a hardware issue:
-
-- The branch's `copy_tensor_raw` implementation adds a strict 128-byte
-  alignment check (flex `DEVICE_ALIGNMENT = 128`):
-
-  ```
-  RuntimeError: copy_tensor_raw: subrange must be 128-byte aligned,
-                got offset=0 length=20
-  ```
-
-- But these two tests allocate `torch.randn(10, device="spyre", dtype=torch.float16)`
-  = **10 fp16 elements = 20 bytes**, which is not 128-byte aligned. The tests
-  were never updated after the alignment check was introduced, so they fail on
-  the original branch too (verified: the test file and the alignment check are
-  byte-identical to the branch tip).
-
-The old pre-alignment-check code **hung** on this misaligned DMA (and wedged
-the card, requiring a hot reset). The new code turns that hang into an
-immediate, correct `RuntimeError` — this is the intended improvement.
-
-### Fix (belongs upstream, in thakobian's branch)
-
-Either:
-
-- Align the test tensors, e.g. `torch.randn(64, ...)` (64 fp16 = 128 bytes), or
-- Relax/remove the alignment check if sub-stick raw copies are meant to be
-  supported.
-
-Not fixed here to keep this branch a faithful rebase of the upstream work.
-
-## Card recovery note
-
-The Spyre card at `0000:ab:00.0` had been left in a `RAS::CBRB::ControlBlockSoftFail`
-state by an earlier run of the *old* (no-alignment-check) code hanging on a
-misaligned DMA. Recovered with a user-level chip-mode hot reset:
+Run from the repository root with the isolated runtime libraries first on
+`LD_LIBRARY_PATH`:
 
 ```bash
-/opt/ibm/spyre/senlib/bin/aiu_dd2_hot_reset -t chip -d ab:00.0
+python -m pytest \
+  tests/test_shared_pool_lifecycle.py \
+  tests/test_shared_host_pool.py \
+  tests/test_shared_metadata.py \
+  tests/test_kv_offload.py \
+  tests/test_kv_page_validator.py -q
 ```
 
-(`-t chip` goes through the VFIO `/dev` node and does not need root, unlike
-`-t linux` which writes the root-owned sysfs `reset`.) After the reset the
-runtime starts cleanly and the 4 passing tests are green.
+Result: **60 passed, 1 skipped, 3 warnings, 7 subtests passed** in 18.77
+seconds.
+
+The skip was the existing isolated-runtime guard. The warnings were existing
+CPU fallback warnings from `torch.arange`. This suite covers eager rank
+selection, aggregate alias close, independently retained metadata/data/read-pin
+leases, persistent generation management, raw copies, page validation, and the
+metadata claim/publish/lookup/pin/evict protocol.
+
+The skipped fresh-parent case was also run alone after its cleanup assertion
+was added: **1 passed** in 11.88 seconds and confirmed that the spawned helper
+removes its generation.
+
+## Two-card rank-scoped verification
+
+Run with `SPYRE_DEVICES=0,1` and the same isolated libraries:
+
+```bash
+bash tests/run_test.sh \
+  tests/configs/distributed_tests/test_shared_host_pool.yaml \
+  tests/configs/distributed_tests/test_kv_offload.yaml \
+  tests/configs/distributed_tests/test_shared_metadata.yaml
+```
+
+Each configuration launched two torchrun ranks and passed:
+
+| Configuration | Result | Time |
+|---|---:|---:|
+| `test_shared_host_pool.yaml` | 1 passed | 8.47 s |
+| `test_kv_offload.yaml` | 1 passed, 1 warning | 8.03 s |
+| `test_shared_metadata.yaml` | 1 passed | 8.25 s |
+
+The tests use one global metadata directory with separate rank-homogeneous
+arenas. Each rank receives only `host-r<rank>` and performs DMA through that
+eager local handle. The metadata test also covers peer metadata visibility,
+same-key claim election, cross-process pin/eviction blocking, slot reuse, and
+rank 1 alone keeping exact-generation destroy at `POOL_BUSY`.
+
+## Repository gates and stale API scan
+
+- `make check-all-configs` passed with 0 duplicate, missing, or unlabeled
+  tests and 183 pre-existing dead-pattern warnings.
+- Selected pre-commit hooks passed for the binding, type stub, helpers, and all
+  single-process and distributed shared-pool tests.
+- The obsolete-API scan found no consumer call to deferred data resolution,
+  no `AttachResult.metadata`, and no metadata detach. Its only match was the
+  intentional assertion that `SharedMetadata` has no `resolve_pool` attribute.
+
+The broader `tests/test_stream.py tests/test_spyre.py` regression run passed
+with **72 passed, 3 skipped, 5 expected failures, 1 warning, and 16 subtests**
+in 21.73 seconds.

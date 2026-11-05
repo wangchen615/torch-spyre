@@ -9,20 +9,55 @@ import typing
 
 __all__: list[str] = [
     "AIUPTI_ACTIVITY_NAME_MAX_BYTES",
+    "AttachedDataPool",
+    "AttachResult",
+    "ChunkDescriptorEntry",
+    "CompatibilityRef",
+    "CompositeAddressHandle",
+    "CompositeChunkInfo",
+    "CompatibleBlockKey",
     "DataFormats",
+    "DestroyResult",
     "JobPlan",
     "ElementArrangement",
+    "ExistingClaim",
+    "MetadataConfig",
+    "LookupEntry",
+    "MarvellPlacement",
+    "NoSpace",
+    "PoolBackend",
+    "PoolAttachment",
+    "PoolCompatibility",
+    "PoolConfig",
+    "PoolDescriptor",
+    "PoolDescriptorResult",
+    "PoolGeneration",
+    "PoolRef",
+    "PoolResultCode",
+    "PoolState",
+    "RegisteredPool",
+    "Reservation",
+    "ReservationToken",
+    "SharedDataPartitionConfig",
+    "SharedDataPool",
+    "SharedDataPoolConfig",
+    "SharedHostPool",
+    "SharedMarvellPool",
+    "SharedMetadata",
+    "SharedPool",
+    "SharedPoolKind",
+    "SlotReadPin",
+    "SlotRef",
     "SpyreStreamError",
     "SpyreDeviceState",
     "SpyreTensorLayout",
     "SymbolicArg",
     "SymbolicArgKind",
-    "SharedPool",
-    "SharedHostPool",
-    "SharedMarvellPool",
+    "Unavailable",
     "_SpyreStreamBase",
     "current_stream",
     "default_stream",
+    "get_composite_address",
     "get_device_state",
     "get_stream_from_pool",
     "set_current_stream",
@@ -57,6 +92,403 @@ __all__: list[str] = [
 
 AIUPTI_ACTIVITY_NAME_MAX_BYTES: int
 
+class PoolBackend:
+    HOST_DRAM: typing.ClassVar[PoolBackend]
+    MARVELL: typing.ClassVar[PoolBackend]
+    name: str
+    value: int
+
+class PoolState:
+    INITIALIZING: typing.ClassVar[PoolState]
+    READY: typing.ClassVar[PoolState]
+    DESTROYING: typing.ClassVar[PoolState]
+    name: str
+    value: int
+
+class PoolResultCode:
+    OK: typing.ClassVar[PoolResultCode]
+    NOT_FOUND: typing.ClassVar[PoolResultCode]
+    ALREADY_EXISTS: typing.ClassVar[PoolResultCode]
+    INITIALIZING: typing.ClassVar[PoolResultCode]
+    DESTROYING: typing.ClassVar[PoolResultCode]
+    POOL_BUSY: typing.ClassVar[PoolResultCode]
+    STALE_GENERATION: typing.ClassVar[PoolResultCode]
+    CONFIGURATION_MISMATCH: typing.ClassVar[PoolResultCode]
+    RESOURCE_ERROR: typing.ClassVar[PoolResultCode]
+    name: str
+    value: int
+
+class SharedPoolKind:
+    HOST: typing.ClassVar[SharedPoolKind]
+    MARVELL: typing.ClassVar[SharedPoolKind]
+    name: str
+    value: int
+
+class PoolCompatibility:
+    def __init__(
+        self,
+        model: str,
+        kv_dtype: str,
+        block_size: int,
+        tensor_parallel_size: int,
+        layout_signature: str = "",
+    ) -> None: ...
+    def __eq__(self, other: object) -> bool: ...
+    @property
+    def model(self) -> str: ...
+    @property
+    def kv_dtype(self) -> str: ...
+    @property
+    def block_size(self) -> int: ...
+    @property
+    def tensor_parallel_size(self) -> int: ...
+    @property
+    def layout_signature(self) -> str: ...
+
+class MetadataConfig:
+    def __init__(self, max_chunks: int) -> None: ...
+    def __eq__(self, other: object) -> bool: ...
+    @property
+    def max_chunks(self) -> int: ...
+
+class SharedDataPartitionConfig:
+    def __init__(
+        self,
+        name: str,
+        tp_rank: int,
+        cache_index: int,
+        num_slots: int,
+        slot_bytes: int,
+        offset_bytes: int | None = None,
+    ) -> None: ...
+    def __eq__(self, other: object) -> bool: ...
+    @property
+    def name(self) -> str: ...
+    @property
+    def tp_rank(self) -> int: ...
+    @property
+    def cache_index(self) -> int: ...
+    @property
+    def num_slots(self) -> int: ...
+    @property
+    def slot_bytes(self) -> int: ...
+    @property
+    def offset_bytes(self) -> int | None: ...
+
+class MarvellPlacement:
+    def __init__(self, pci_bdf: str, bar_offset: int | None = None) -> None: ...
+    def __eq__(self, other: object) -> bool: ...
+    @property
+    def pci_bdf(self) -> str: ...
+    @property
+    def bar_offset(self) -> int | None: ...
+
+class SharedDataPoolConfig:
+    @typing.overload
+    def __init__(
+        self,
+        name: str,
+        backend: PoolBackend,
+        num_slots: int,
+        slot_bytes: int,
+        compatibility: PoolCompatibility,
+        *,
+        marvell: MarvellPlacement | None = None,
+    ) -> None: ...
+    @typing.overload
+    def __init__(
+        self,
+        name: str,
+        backend: PoolBackend,
+        partitions: collections.abc.Sequence[SharedDataPartitionConfig],
+        compatibility: PoolCompatibility,
+        *,
+        marvell: MarvellPlacement | None = None,
+    ) -> None: ...
+    @typing.overload
+    def __init__(
+        self,
+        name: str,
+        backend: PoolBackend,
+        num_slots: int,
+        slot_bytes: int,
+        partitions: collections.abc.Sequence[SharedDataPartitionConfig],
+        compatibility: PoolCompatibility,
+        *,
+        marvell: MarvellPlacement | None = None,
+    ) -> None: ...
+    def __eq__(self, other: object) -> bool: ...
+    @property
+    def name(self) -> str: ...
+    @property
+    def backend(self) -> PoolBackend: ...
+    @property
+    def num_slots(self) -> int: ...
+    @property
+    def slot_bytes(self) -> int: ...
+    @property
+    def partitions(self) -> list[SharedDataPartitionConfig]: ...
+    @property
+    def compatibility(self) -> PoolCompatibility: ...
+    @property
+    def marvell(self) -> MarvellPlacement | None: ...
+
+class PoolConfig:
+    def __init__(
+        self,
+        name: str,
+        metadata: MetadataConfig,
+        data_pools: collections.abc.Sequence[SharedDataPoolConfig],
+    ) -> None: ...
+    def __eq__(self, other: object) -> bool: ...
+    @property
+    def name(self) -> str: ...
+    @property
+    def metadata(self) -> MetadataConfig: ...
+    @property
+    def data_pools(self) -> list[SharedDataPoolConfig]: ...
+
+class PoolGeneration:
+    def __eq__(self, other: object) -> bool: ...
+    @property
+    def bytes(self) -> bytes: ...
+
+class PoolDescriptor:
+    def __eq__(self, other: object) -> bool: ...
+    @property
+    def name(self) -> str: ...
+    @property
+    def generation(self) -> PoolGeneration: ...
+    @property
+    def state(self) -> PoolState: ...
+    @property
+    def effective_config(self) -> PoolConfig: ...
+
+class PoolDescriptorResult:
+    @property
+    def code(self) -> PoolResultCode: ...
+    @property
+    def descriptor(self) -> PoolDescriptor: ...
+    @property
+    def detail(self) -> str: ...
+
+class DestroyResult:
+    @property
+    def code(self) -> PoolResultCode: ...
+    @property
+    def detail(self) -> str: ...
+
+class CompatibilityRef:
+    def __eq__(self, other: object) -> bool: ...
+    @property
+    def metadata_version(self) -> int: ...
+    @property
+    def compatibility_id(self) -> int: ...
+
+class PoolRef:
+    def __eq__(self, other: object) -> bool: ...
+    @property
+    def metadata_version(self) -> int: ...
+    @property
+    def pool_id(self) -> int: ...
+    @property
+    def pool_version(self) -> int: ...
+
+class RegisteredPool:
+    @property
+    def pool_ref(self) -> PoolRef: ...
+    @property
+    def compatibility(self) -> CompatibilityRef: ...
+    @property
+    def name(self) -> str: ...
+    @property
+    def kind(self) -> SharedPoolKind: ...
+    @property
+    def slot_count(self) -> int: ...
+    @property
+    def slot_bytes(self) -> int: ...
+
+class CompatibleBlockKey:
+    def __init__(self, compatibility: CompatibilityRef, block_hash: int) -> None: ...
+    def __eq__(self, other: object) -> bool: ...
+    @property
+    def compatibility(self) -> CompatibilityRef: ...
+    @property
+    def block_hash(self) -> int: ...
+
+class SlotRef:
+    def __eq__(self, other: object) -> bool: ...
+    @property
+    def pool(self) -> PoolRef: ...
+    @property
+    def slot_id(self) -> int: ...
+    @property
+    def slot_version(self) -> int: ...
+
+class ReservationToken:
+    def __eq__(self, other: object) -> bool: ...
+    @property
+    def key(self) -> CompatibleBlockKey: ...
+    @property
+    def slot(self) -> SlotRef: ...
+
+class ChunkDescriptorEntry:
+    def __init__(self, domain_id: int, size: int) -> None: ...
+    @property
+    def domain_id(self) -> int: ...
+    @property
+    def size(self) -> int: ...
+
+class LookupEntry:
+    @property
+    def key(self) -> CompatibleBlockKey: ...
+    @property
+    def slot(self) -> SlotRef: ...
+    @property
+    def chunks(self) -> list[ChunkDescriptorEntry]: ...
+
+class Reservation:
+    @property
+    def key(self) -> CompatibleBlockKey: ...
+    @property
+    def slot(self) -> SlotRef: ...
+    @property
+    def token(self) -> ReservationToken: ...
+
+class ExistingClaim:
+    @property
+    def slot(self) -> SlotRef: ...
+    @property
+    def valid(self) -> bool: ...
+
+class NoSpace: ...
+class Unavailable: ...
+class SlotReadPin: ...
+
+class SharedDataPool:
+    def name(self) -> str: ...
+    def slot_count(self) -> int: ...
+    def slot_bytes(self) -> int: ...
+    def total_bytes(self) -> int: ...
+
+class SharedHostPool(SharedDataPool): ...
+
+class SharedMarvellPool(SharedDataPool):
+    """SharedDataPool whose slots live in a Marvell card's PCI BAR2 window.
+
+    Copies are peer-to-peer between Spyre HBM and the card. Windows of raw
+    create_or_attach pools are not checked for overlap.
+    """
+
+    @staticmethod
+    def create_or_attach(
+        name: str,
+        pci_bdf: str,
+        num_slots: typing.SupportsInt,
+        slot_bytes: typing.SupportsInt,
+        bar_offset: typing.SupportsInt = 0,
+    ) -> SharedMarvellPool: ...
+    @staticmethod
+    def unlink_by_name(name: str) -> None: ...
+    @property
+    def bus_address(self) -> int:
+        """PCI bus address of slot 0 (BAR2 base + bar_offset)."""
+        ...
+
+class AttachedDataPool:
+    @property
+    def registration(self) -> RegisteredPool: ...
+    @property
+    def data_pool(self) -> SharedDataPool: ...
+
+class CompositeChunkInfo:
+    @property
+    def region_id(self) -> int: ...
+    @property
+    def offset(self) -> int: ...
+    @property
+    def size(self) -> int: ...
+    @property
+    def domain_id(self) -> int: ...
+
+class CompositeAddressHandle:
+    @property
+    def total_size(self) -> int: ...
+    @property
+    def num_chunks(self) -> int: ...
+    def chunks(self) -> list[CompositeChunkInfo]: ...
+
+class SharedMetadata:
+    def pool_count(self) -> int: ...
+    def version(self) -> int: ...
+    def find_pool(self, name: str) -> RegisteredPool | None: ...
+    def lookup(self, key: CompatibleBlockKey) -> LookupEntry | None: ...
+    def pin_read(self, entry: LookupEntry) -> SlotReadPin | None: ...
+    def claim(
+        self, target_pool: PoolRef, key: CompatibleBlockKey
+    ) -> Reservation | ExistingClaim | NoSpace | Unavailable: ...
+    @typing.overload
+    def publish(
+        self, reservation: Reservation, chunks: list[ChunkDescriptorEntry]
+    ) -> None: ...
+    @typing.overload
+    def publish(
+        self, reservation: ReservationToken, chunks: list[ChunkDescriptorEntry]
+    ) -> None: ...
+    @typing.overload
+    def abort(self, reservation: Reservation) -> None: ...
+    @typing.overload
+    def abort(self, reservation: ReservationToken) -> None: ...
+    def evict(self, entry: LookupEntry) -> bool: ...
+
+class PoolAttachment:
+    @property
+    def tp_rank(self) -> int: ...
+    @property
+    def metadata(self) -> SharedMetadata: ...
+    @property
+    def data_pools(self) -> list[AttachedDataPool]: ...
+    def close(self) -> None: ...
+
+class AttachResult:
+    @property
+    def code(self) -> PoolResultCode: ...
+    @property
+    def attachment(self) -> PoolAttachment | None: ...
+    @property
+    def detail(self) -> str: ...
+
+class SharedPool:
+    @staticmethod
+    def create_pool(config: PoolConfig) -> PoolDescriptorResult: ...
+    @staticmethod
+    def open_pool(name: str) -> PoolDescriptorResult: ...
+    @staticmethod
+    def destroy_pool(descriptor: PoolDescriptor) -> DestroyResult: ...
+    @staticmethod
+    @typing.overload
+    def attach_pool(descriptor: PoolDescriptor, tp_rank: int) -> AttachResult: ...
+    @staticmethod
+    @typing.overload
+    def attach_pool(
+        name: str, expected_generation: bytes, tp_rank: int
+    ) -> AttachResult: ...
+    @staticmethod
+    @typing.overload
+    def attach_pool(
+        name: str,
+        expected_generation: bytes,
+        expected_config: PoolConfig,
+        tp_rank: int,
+    ) -> AttachResult: ...
+    @staticmethod
+    def detach_pool(attachment: PoolAttachment | None) -> None: ...
+
+def _decode_pool_descriptor_state(state: tuple[typing.Any, ...]) -> PoolDescriptor: ...
+def _decode_pool_config_state(state: tuple[typing.Any, ...]) -> PoolConfig: ...
+def _decode_reservation_token_state(
+    state: tuple[typing.Any, ...],
+) -> ReservationToken: ...
 def extract_kernel_provenance_key(event_name: str) -> str | None: ...
 def kernel_provenance_registry_stats() -> dict[str, int]: ...
 def lookup_kernel_provenance(key: str) -> list[str] | None: ...
@@ -225,46 +657,6 @@ class SpyreTensorLayout:
     @property
     def stride_map(self) -> list[int]: ...
 
-class SharedPool:
-    """Fixed-size, index-addressed slots shared across processes by name."""
-
-    def slot_count(self) -> int: ...
-    def slot_bytes(self) -> int: ...
-    def name(self) -> str: ...
-    def total_bytes(self) -> int: ...
-
-class SharedHostPool(SharedPool):
-    """SharedPool whose slots live in host POSIX shared memory."""
-
-    @staticmethod
-    def create_or_attach(
-        name: str, num_slots: typing.SupportsInt, slot_bytes: typing.SupportsInt
-    ) -> SharedHostPool: ...
-    @staticmethod
-    def unlink_by_name(name: str) -> None: ...
-
-class SharedMarvellPool(SharedPool):
-    """SharedPool whose slots live in a Marvell card's PCI BAR2 window.
-
-    Copies are peer-to-peer between Spyre HBM and the card. Overlapping BAR2
-    windows of pools under different names are not detected.
-    """
-
-    @staticmethod
-    def create_or_attach(
-        name: str,
-        pci_bdf: str,
-        num_slots: typing.SupportsInt,
-        slot_bytes: typing.SupportsInt,
-        bar_offset: typing.SupportsInt = 0,
-    ) -> SharedMarvellPool: ...
-    @staticmethod
-    def unlink_by_name(name: str) -> None: ...
-    @property
-    def bus_address(self) -> int:
-        """PCI bus address of slot 0 (BAR2 base + bar_offset)."""
-        ...
-
 class _SpyreStreamBase:
     """
     C++ SpyreStream wrapper class.
@@ -368,25 +760,20 @@ def copy_tensor(
 
 def copy_tensor_raw(
     dev_tensor: torch.Tensor,
-    pool: SharedPool,
-    slot_id: typing.SupportsInt,
+    pool: SharedDataPool,
+    slot_id: int,
     to_device: bool,
     non_blocking: bool = False,
-) -> None:
-    """Copy a device tensor's bytes to or from one pool slot."""
-    ...
-
+) -> None: ...
 def copy_kv_page_raw(
     cache: torch.Tensor,
-    block_id: typing.SupportsInt,
-    pool: SharedPool,
-    slot_id: typing.SupportsInt,
+    block_id: int,
+    pool: SharedDataPool,
+    slot_id: int,
     to_device: bool,
     non_blocking: bool = False,
-) -> None:
-    """Copy one validated KV cache page to or from one pool slot."""
-    ...
-
+) -> None: ...
+def get_composite_address(tensor: torch.Tensor) -> CompositeAddressHandle: ...
 def fill_tensor(self: torch.Tensor, value: float) -> torch.Tensor:
     """
     Fill a spyre tensor with a scalar value using device-side FillDMA.
